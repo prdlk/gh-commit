@@ -91,9 +91,13 @@ def require_git() -> Path:
 def init_db():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(DB_PATH))
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_repositories START 1")
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_scopes START 1")
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_scope_paths START 1")
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_github_labels START 1")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS repositories (
-            id INTEGER PRIMARY KEY,
+            id INTEGER DEFAULT nextval('seq_repositories') PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -102,7 +106,7 @@ def init_db():
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scopes (
-            id INTEGER PRIMARY KEY,
+            id INTEGER DEFAULT nextval('seq_scopes') PRIMARY KEY,
             repo_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -111,7 +115,7 @@ def init_db():
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scope_paths (
-            id INTEGER PRIMARY KEY,
+            id INTEGER DEFAULT nextval('seq_scope_paths') PRIMARY KEY,
             scope_id INTEGER NOT NULL,
             path TEXT NOT NULL,
             UNIQUE(scope_id, path)
@@ -119,7 +123,7 @@ def init_db():
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS github_labels (
-            id INTEGER PRIMARY KEY,
+            id INTEGER DEFAULT nextval('seq_github_labels') PRIMARY KEY,
             scope_id INTEGER NOT NULL,
             label_name TEXT NOT NULL,
             color TEXT,
