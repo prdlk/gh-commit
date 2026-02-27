@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gh-commit: AI-powered scoped git commits
+# Install: gh extension install prdlk/gh-commit
+# Requires: uv (https://docs.astral.sh/uv)
+
+EXTENSION_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="${EXTENSION_DIR}/smartcommit.py"
+
+if ! command -v uv &>/dev/null; then
+  echo "error: 'uv' is required but not installed"
+  echo "install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+  exit 1
+fi
+
+exec uv run --script "${SCRIPT}" "$@"
