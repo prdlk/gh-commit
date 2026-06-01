@@ -7,16 +7,23 @@
 #     "questionary>=2.0.0",
 # ]
 # ///
-"""gh-commit - AI-powered scoped git commits with DuckDB storage."""
+"""gh-commit - AI-powered scoped git commits, driven entirely by Claude over ACP.
 
+A single Claude agent (reached through the Agent Client Protocol) handles both
+scope generation and commit-message writing. Scopes live in a local DuckDB and
+auto-regenerate whenever the repository's .gitignore changes.
+"""
+
+import atexit
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,15 +41,20 @@ console = Console()
 DB_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "gh-commit"
 DB_PATH = DB_DIR / "gh-commit.db"
 
-MODS_CMD = os.environ.get(
-    "GH_COMMIT_MODS_CMD",
-    "mods --mcp-disable github --mcp-disable context7 -R write-commit",
+# The ACP bridge that exposes Claude Code as an Agent Client Protocol server.
+ACP_CMD = os.environ.get(
+    "GH_COMMIT_ACP_CMD",
+    "npx --yes @zed-industries/claude-code-acp",
 ).split()
+ACP_PERMISSION_MODE = os.environ.get("GH_COMMIT_ACP_PERMISSION", "bypassPermissions")
+ACP_TIMEOUT = int(os.environ.get("GH_COMMIT_ACP_TIMEOUT", "300"))
 
 AUTO_CONFIRM = os.environ.get("GH_COMMIT_AUTO", "0") == "1"
 AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
+NO_AUTO_REFRESH = os.environ.get("GH_COMMIT_NO_AUTO_REFRESH", "0") == "1"
+DEBUG = os.environ.get("GH_COMMIT_DEBUG", "0") == "1"
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,6 +98,210 @@ def require_git() -> Path:
     return get_repo_root()
 
 
+# ── Claude ACP client ───────────────────────────────────────────────────────────
+
+class ACPError(RuntimeError):
+    """Raised when the ACP bridge or the underlying Claude agent fails."""
+
+
+class ACPClient:
+    """Minimal Agent Client Protocol client speaking newline-delimited JSON-RPC
+    to a Claude Code ACP bridge subprocess.
+
+    One bridge process is reused for the life of the run; every prompt gets a
+    fresh session so individual generations never bleed context into each other.
+    """
+
+    def __init__(self, cwd: Path):
+        self.cwd = str(cwd)
+        self._proc: Optional[subprocess.Popen] = None
+        self._pending: dict[int, dict] = {}
+        self._next_id = 0
+        self._lock = threading.Lock()
+        self._chunks: list[str] = []
+        self._active_session: Optional[str] = None
+
+    # -- lifecycle --------------------------------------------------------------
+
+    def _ensure_started(self):
+        if self._proc is not None:
+            return
+        env = dict(os.environ)
+        # The bridge launches a nested Claude Code; clear markers that would make
+        # it refuse to start when gh-commit itself is run from inside Claude Code.
+        for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+            env.pop(key, None)
+        env.setdefault("ACP_PERMISSION_MODE", ACP_PERMISSION_MODE)
+
+        stderr = None if DEBUG else subprocess.DEVNULL
+        try:
+            self._proc = subprocess.Popen(
+                ACP_CMD,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+                bufsize=1,
+                cwd=self.cwd,
+                env=env,
+            )
+        except FileNotFoundError as e:
+            raise ACPError(
+                f"Could not launch ACP bridge ({ACP_CMD[0]!r} not found). "
+                "Install Node.js, or set GH_COMMIT_ACP_CMD to a working bridge."
+            ) from e
+
+        threading.Thread(target=self._reader, daemon=True).start()
+        self._initialize()
+
+    def close(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self._proc = None
+
+    # -- transport --------------------------------------------------------------
+
+    def _write(self, msg: dict):
+        if not self._proc or not self._proc.stdin:
+            raise ACPError("ACP bridge is not running")
+        self._proc.stdin.write(json.dumps(msg) + "\n")
+        self._proc.stdin.flush()
+
+    def _send_request(self, method: str, params: dict) -> int:
+        with self._lock:
+            rid = self._next_id
+            self._next_id += 1
+            self._pending[rid] = {"event": threading.Event(), "result": None, "error": None}
+        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        return rid
+
+    def _respond(self, rid, result=None, error=None):
+        msg = {"jsonrpc": "2.0", "id": rid}
+        if error is not None:
+            msg["error"] = error
+        else:
+            msg["result"] = result if result is not None else {}
+        self._write(msg)
+
+    def _reader(self):
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._dispatch(msg)
+        # Stream closed: unblock anything still waiting.
+        for p in self._pending.values():
+            if p["error"] is None and p["result"] is None:
+                p["error"] = {"message": "ACP bridge closed the connection"}
+            p["event"].set()
+
+    def _dispatch(self, msg: dict):
+        # Response to one of our requests.
+        if "id" in msg and ("result" in msg or "error" in msg):
+            p = self._pending.get(msg["id"])
+            if p:
+                p["result"], p["error"] = msg.get("result"), msg.get("error")
+                p["event"].set()
+            return
+        # Request from the agent that needs a reply.
+        if "method" in msg and "id" in msg:
+            self._on_agent_request(msg)
+            return
+        # One-way notification.
+        if msg.get("method") == "session/update":
+            self._on_update(msg.get("params", {}))
+
+    def _on_agent_request(self, msg: dict):
+        method = msg["method"]
+        params = msg.get("params", {})
+        if method == "session/request_permission":
+            options = params.get("options", [])
+            choice = next(
+                (o["optionId"] for o in options if "allow" in o.get("optionId", "").lower()),
+                options[0]["optionId"] if options else "allow",
+            )
+            self._respond(msg["id"], {"outcome": {"outcome": "selected", "optionId": choice}})
+        elif method == "fs/read_text_file":
+            try:
+                self._respond(msg["id"], {"content": Path(params["path"]).read_text()})
+            except Exception as e:
+                self._respond(msg["id"], error={"code": -32603, "message": str(e)})
+        else:
+            # We advertise no client-side capabilities; decline anything else.
+            self._respond(msg["id"], error={"code": -32601, "message": "unsupported"})
+
+    def _on_update(self, params: dict):
+        if params.get("sessionId") and params["sessionId"] != self._active_session:
+            return
+        update = params.get("update", {})
+        kind = update.get("sessionUpdate") or update.get("type")
+        if kind == "agent_message_chunk":
+            content = update.get("content", {})
+            if content.get("type") == "text":
+                self._chunks.append(content.get("text", ""))
+
+    def _call(self, method: str, params: dict, timeout: int) -> dict:
+        rid = self._send_request(method, params)
+        p = self._pending[rid]
+        if not p["event"].wait(timeout):
+            self._pending.pop(rid, None)
+            raise ACPError(f"ACP request timed out: {method}")
+        self._pending.pop(rid, None)
+        if p["error"]:
+            raise ACPError(p["error"].get("message", str(p["error"])))
+        return p["result"] or {}
+
+    # -- protocol ---------------------------------------------------------------
+
+    def _initialize(self):
+        self._call("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {"readTextFile": False, "writeTextFile": False},
+                "terminal": False,
+            },
+            "clientInfo": {"name": "gh-commit", "version": VERSION},
+        }, timeout=60)
+
+    def prompt(self, text: str) -> str:
+        """Run one prompt in a fresh session and return the agent's text reply."""
+        self._ensure_started()
+        session = self._call("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=120)
+        sid = session.get("sessionId")
+        if not sid:
+            raise ACPError("ACP bridge did not return a session id")
+        with self._lock:
+            self._chunks = []
+            self._active_session = sid
+        self._call("session/prompt", {
+            "sessionId": sid,
+            "prompt": [{"type": "text", "text": text}],
+        }, timeout=ACP_TIMEOUT)
+        return "".join(self._chunks).strip()
+
+
+_acp: Optional[ACPClient] = None
+
+
+def acp_prompt(text: str, cwd: Path) -> str:
+    """Send a prompt to the shared Claude ACP client, starting it on first use."""
+    global _acp
+    if _acp is None:
+        _acp = ACPClient(cwd)
+        atexit.register(_acp.close)
+    return _acp.prompt(text)
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -100,6 +316,7 @@ def init_db():
             id INTEGER DEFAULT nextval('seq_repositories') PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
+            gitignore_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -131,6 +348,15 @@ def init_db():
             UNIQUE(scope_id)
         )
     """)
+    # Migrate older databases that predate gitignore tracking.
+    cols = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'repositories'"
+        ).fetchall()
+    }
+    if "gitignore_hash" not in cols:
+        conn.execute("ALTER TABLE repositories ADD COLUMN gitignore_hash TEXT")
     conn.close()
 
 
@@ -176,6 +402,7 @@ def _cascade_delete_repo(conn, repo_id: int):
 
 
 def save_scopes(repo_path: str, repo_name: str, scopes: dict[str, list[str]]):
+    """Persist scopes for a repo and snapshot the current .gitignore hash."""
     conn = get_db()
     result = conn.execute("SELECT id FROM repositories WHERE path = ?", [repo_path]).fetchone()
     if result:
@@ -194,8 +421,18 @@ def save_scopes(repo_path: str, repo_name: str, scopes: dict[str, list[str]]):
         for path in (paths if isinstance(paths, list) else [paths]):
             conn.execute("INSERT INTO scope_paths (scope_id, path) VALUES (?, ?)", [scope_id, path])
 
-    conn.execute("UPDATE repositories SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", [repo_id])
+    conn.execute(
+        "UPDATE repositories SET updated_at = CURRENT_TIMESTAMP, gitignore_hash = ? WHERE id = ?",
+        [current_gitignore_hash(Path(repo_path)), repo_id],
+    )
     conn.close()
+
+
+def get_stored_gitignore_hash(repo_path: str) -> Optional[str]:
+    conn = get_db()
+    row = conn.execute("SELECT gitignore_hash FROM repositories WHERE path = ?", [repo_path]).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def list_repos() -> list[tuple]:
@@ -219,6 +456,16 @@ def delete_repo(repo_path: str):
         _cascade_delete_repo(conn, repo_id)
         conn.execute("DELETE FROM repositories WHERE id = ?", [repo_id])
     conn.close()
+
+
+# ── .gitignore tracking ─────────────────────────────────────────────────────────
+
+def current_gitignore_hash(repo_root: Path) -> str:
+    """SHA-256 of the repo's .gitignore, or "" when there is none."""
+    gitignore = repo_root / ".gitignore"
+    if not gitignore.exists():
+        return ""
+    return hashlib.sha256(gitignore.read_bytes()).hexdigest()
 
 
 # ── Migration ─────────────────────────────────────────────────────────────────
@@ -335,95 +582,122 @@ def filter_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-# ── AI integration ────────────────────────────────────────────────────────────
+# ── AI integration (Claude over ACP) ─────────────────────────────────────────────
 
-def generate_commit_message(diff: str, scope: Optional[str] = None) -> Optional[str]:
-    filtered = filter_diff(diff)
-    context = f"### Git Diff\n{filtered}"
-    if scope:
-        context += f"\n\n### Scope\n{scope}"
-    try:
-        result = subprocess.run(
-            MODS_CMD, input=context, capture_output=True, text=True, check=True,
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Failed to generate commit message: {e}[/]")
+COMMIT_PROMPT = """\
+Write a single Conventional Commits message for the staged changes shown below.
+
+Requirements:
+- Format: type(scope): summary  (e.g. feat, fix, docs, refactor, chore, test, ci)
+- Keep the summary under ~70 characters, imperative mood, no trailing period.
+- Optionally add a blank line then a concise body explaining the "why" (wrap ~72 cols).
+- Base the message ONLY on the diff below — do not invoke any tools.
+- Output ONLY the commit message. No code fences, no preamble, no commentary.
+{scope_hint}
+### Git Diff
+{diff}
+"""
+
+SCOPE_PROMPT_NEW = """\
+You are configuring commit "scopes" for this git repository at {cwd}.
+
+Inspect the repository's directory structure and key files, then map logical
+project areas to the paths they cover.
+
+Rules:
+- Scope names must read well in Conventional Commits: e.g. core, api, ui, cli,
+  docs, tests, ci, config, scripts, deps.
+- Each scope maps to an array of repo-relative path prefixes (directories or files).
+- Cover the meaningful source areas and group related paths together.
+- Respect .gitignore: never create scopes for ignored, generated, or vendored paths.
+- Output ONLY a single JSON object of the form {{"scope": ["path", ...], ...}}.
+  No prose, no markdown fences.
+"""
+
+SCOPE_PROMPT_UPDATE = """\
+You are updating the commit "scopes" for this git repository at {cwd}.
+
+Current scopes (JSON):
+{existing}
+
+Re-inspect the repository's current structure (it may have changed, e.g. its
+.gitignore was edited) and produce an updated mapping.
+
+Rules:
+- Keep scopes that still make sense; drop ones whose paths no longer exist.
+- Add scopes for new meaningful areas.
+- Scope names must read well in Conventional Commits.
+- Respect .gitignore: never create scopes for ignored, generated, or vendored paths.
+- Output ONLY a single JSON object of the form {{"scope": ["path", ...], ...}}.
+  No prose, no markdown fences.
+"""
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """Return the first balanced top-level {...} object found in text."""
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if start is None:
+                start = i
+            depth += 1
+        elif ch == "}" and start is not None:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def parse_scopes_response(text: str) -> Optional[dict[str, list[str]]]:
+    blob = _extract_json_object(text)
+    if not blob:
         return None
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    scopes: dict[str, list[str]] = {}
+    for name, paths in data.items():
+        if isinstance(paths, str):
+            scopes[str(name)] = [paths]
+        elif isinstance(paths, list):
+            scopes[str(name)] = [str(p) for p in paths if str(p).strip()]
+    return scopes or None
 
 
-def generate_scopes_with_claude(repo_path: Path, existing_toml: Optional[str] = None) -> Optional[str]:
-    if existing_toml:
-        prompt = f"""Analyze this git repository and UPDATE the existing scopes configuration.
+def generate_commit_message(diff: str, repo_path: Path, scope: Optional[str] = None) -> Optional[str]:
+    scope_hint = f"- Use this scope: {scope}\n" if scope else ""
+    prompt = COMMIT_PROMPT.format(scope_hint=scope_hint, diff=filter_diff(diff))
+    try:
+        message = acp_prompt(prompt, repo_path)
+    except ACPError as e:
+        console.print(f"[red]Claude (ACP) failed to generate a commit message: {e}[/]")
+        return None
+    # Strip stray code fences if the model added them anyway.
+    message = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", message.strip()).strip()
+    return message or None
 
-Current scopes:
-{existing_toml}
 
-Your task:
-1. Review the current scopes and their paths
-2. Analyze the current repository directory structure
-3. Update the scopes to reflect any new directories or structural changes
-4. Keep existing scopes that are still relevant
-5. Remove scopes for paths that no longer exist
-6. Add new scopes for new directories or logical areas
-
-Output ONLY the updated TOML content (no markdown, no explanation, just the raw TOML)."""
+def generate_scopes(repo_path: Path, existing: Optional[dict[str, list[str]]] = None) -> Optional[dict[str, list[str]]]:
+    if existing:
+        prompt = SCOPE_PROMPT_UPDATE.format(cwd=repo_path, existing=json.dumps(existing, indent=2))
     else:
-        prompt = """Analyze this git repository and generate a TOML scopes configuration.
-
-The output should:
-1. Have a [scopes] section
-2. Map logical project areas to arrays of directory paths
-3. Each scope can have MULTIPLE paths
-4. Use scope names that work well in conventional commits (e.g., 'docs', 'tests', 'config', 'ci', 'scripts')
-5. Cover the main directories in the repository
-6. Group related paths under the same scope when appropriate
-
-Example format:
-[scopes]
-ci = [".github/workflows"]
-config = [".github", ".config", "package.json"]
-docs = ["docs", "README.md"]
-tests = ["tests", "__tests__"]
-scripts = ["scripts", "bin"]
-core = ["src"]
-
-Please analyze the repository structure and output ONLY the TOML content (no markdown, no explanation, just the raw TOML)."""
-
+        prompt = SCOPE_PROMPT_NEW.format(cwd=repo_path)
     try:
-        with console.status("[magenta]Analyzing repository with Claude...[/]"):
-            result = subprocess.run(
-                ["claude", "-p"], input=prompt,
-                capture_output=True, text=True, check=True, cwd=repo_path,
-            )
-        output = result.stdout.strip()
-        if "[scopes]" in output:
-            output = output[output.find("[scopes]"):]
-        if "```" in output:
-            output = output[: output.find("```")]
-        return output.strip()
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Claude failed: {e.stderr}[/]")
+        with console.status("[magenta]Analyzing repository with Claude (ACP)...[/]"):
+            output = acp_prompt(prompt, repo_path)
+    except ACPError as e:
+        console.print(f"[red]Claude (ACP) failed: {e}[/]")
         return None
-    except FileNotFoundError:
-        console.print("[red]Error: 'claude' command not found. Install Claude Code:[/]")
-        console.print("[cyan]  npm install -g @anthropic-ai/claude-code[/]")
-        return None
-
-
-def parse_toml_scopes(toml_str: str) -> Optional[dict[str, list[str]]]:
-    try:
-        return tomllib.loads(toml_str).get("scopes", {})
-    except Exception:
-        return None
-
-
-def scopes_to_toml(scopes: dict[str, list[str]]) -> str:
-    lines = ["[scopes]"]
-    for name, paths in sorted(scopes.items()):
-        paths_str = ", ".join(f'"{p}"' for p in paths)
-        lines.append(f'{name} = [{paths_str}]')
-    return "\n".join(lines)
+    scopes = parse_scopes_response(output)
+    if not scopes:
+        console.print("[red]Could not parse scopes from Claude's response[/]")
+        if DEBUG:
+            console.print(f"[dim]{output}[/]")
+    return scopes
 
 
 def display_scopes(scopes: dict[str, list[str]]):
@@ -443,10 +717,8 @@ def get_changed_files() -> list[str]:
 def get_files_in_scope(files: list[str], paths: list[str]) -> list[str]:
     matched = []
     for f in files:
-        for path in paths:
-            if f.startswith(path):
-                matched.append(f)
-                break
+        if any(f.startswith(p) for p in paths):
+            matched.append(f)
     return matched
 
 
@@ -475,6 +747,63 @@ def push_to_origin():
     console.print(f"[green]✓ Pushed to origin/{branch}[/]")
 
 
+def commit_group(repo_path: Path, files: list[str], scope: Optional[str] = None) -> bool:
+    """Stage `files`, generate a message, and commit them as one group."""
+    files = [f for f in files if f]
+    if not files:
+        return False
+
+    reset_staging()
+    stage_files(files)
+    diff = git("diff", "--cached")
+    if not diff:
+        reset_staging()
+        return False
+
+    with console.status("[magenta]Generating commit message...[/]"):
+        message = generate_commit_message(diff, repo_path, scope)
+    if not message:
+        reset_staging()
+        return False
+
+    console.print(Panel(message, border_style="magenta"))
+    label = scope or "these changes"
+    if confirm(f"Commit {label}?"):
+        do_commit(message)
+        console.print(f"[green]✓ Committed {label}[/]\n")
+        return True
+    reset_staging()
+    console.print(f"[dim]  Skipped {label}[/]\n")
+    return False
+
+
+# ── Scope auto-refresh ───────────────────────────────────────────────────────────
+
+def maybe_auto_refresh_scopes(repo_path: Path, repo_name: str):
+    """Regenerate scopes automatically when .gitignore has changed since last save."""
+    if NO_AUTO_REFRESH:
+        return
+    current = current_gitignore_hash(repo_path)
+    stored = get_stored_gitignore_hash(str(repo_path))
+    # First time we've seen this repo's .gitignore — record a baseline, don't refresh.
+    if stored is None:
+        save_scopes(str(repo_path), repo_name, get_repo_scopes(str(repo_path)))
+        return
+    if current == stored:
+        return
+
+    console.print("[yellow]↻ .gitignore changed — regenerating scopes with Claude...[/]")
+    existing = get_repo_scopes(str(repo_path))
+    scopes = generate_scopes(repo_path, existing)
+    if not scopes:
+        console.print("[dim]  Keeping existing scopes (regeneration failed)[/]\n")
+        return
+    save_scopes(str(repo_path), repo_name, scopes)
+    console.print("[green]✓ Scopes updated:[/]")
+    display_scopes(scopes)
+    console.print()
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_version():
@@ -482,7 +811,7 @@ def cmd_version():
 
 
 def cmd_help():
-    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits\n")
+    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (Claude ACP)\n")
     console.print("[cyan]Usage:[/]")
     console.print("  gh commit                  Commit changes grouped by scope")
     console.print("  gh commit --auto           Auto-confirm all prompts")
@@ -501,9 +830,12 @@ def cmd_help():
     console.print("[cyan]Environment:[/]")
     console.print("  GH_COMMIT_AUTO=1           Skip all confirmation prompts")
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
-    console.print("  GH_COMMIT_MODS_CMD=...     Override mods command\n")
-    console.print("[cyan]Migration:[/]")
-    console.print("  Existing .github/Repo.toml or scopes.json are auto-migrated on first run")
+    console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
+    console.print("  GH_COMMIT_ACP_CMD=...      Override the Claude ACP bridge command")
+    console.print("  GH_COMMIT_ACP_PERMISSION=  ACP permission mode (default bypassPermissions)")
+    console.print("  GH_COMMIT_DEBUG=1          Show ACP bridge stderr / parse diagnostics\n")
+    console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
+    console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
 
 
 def cmd_db_path():
@@ -560,14 +892,8 @@ def cmd_init():
             return 0
 
     console.print(f"[magenta bold]Generating scopes for {repo_name}...[/]\n")
-    toml_output = generate_scopes_with_claude(repo_path)
-    if not toml_output:
-        return 1
-
-    scopes = parse_toml_scopes(toml_output)
+    scopes = generate_scopes(repo_path)
     if not scopes:
-        console.print("[red]Error: Generated output is not valid TOML[/]")
-        console.print(f"[dim]{toml_output}[/]")
         return 1
 
     save_scopes(str(repo_path), repo_name, scopes)
@@ -596,13 +922,8 @@ def cmd_refresh():
         console.print("[dim]Cancelled[/]")
         return 0
 
-    toml_output = generate_scopes_with_claude(repo_path, scopes_to_toml(existing_scopes))
-    if not toml_output:
-        return 1
-
-    scopes = parse_toml_scopes(toml_output)
+    scopes = generate_scopes(repo_path, existing_scopes)
     if not scopes:
-        console.print("[red]Error: Generated output is not valid TOML[/]")
         return 1
 
     console.print("\n[green]✓ Generated updated scopes[/]\n")
@@ -665,6 +986,7 @@ def cmd_sync():
 
 def cmd_commit():
     repo_path = require_git()
+    repo_name = repo_path.name
 
     auto_migrate(repo_path)
 
@@ -672,10 +994,14 @@ def cmd_commit():
         console.print("\n[yellow bold]⚠ No scopes configured for this repository[/]\n")
         console.print("[cyan]gh-commit organizes commits by project areas (scopes).[/]\n")
         if confirm("Generate scopes now using Claude?"):
-            return cmd_init()
+            if cmd_init() != 0:
+                return 1
         else:
             console.print("\n[dim]Run 'gh commit init' to configure scopes[/]")
             return 1
+
+    # Keep scopes aligned with the repo whenever .gitignore changes.
+    maybe_auto_refresh_scopes(repo_path, repo_name)
 
     console.print("[magenta]Finding scopes with changes...[/]")
     changed_files = get_changed_files()
@@ -691,90 +1017,36 @@ def cmd_commit():
     else:
         console.print(f"[cyan]Scopes with changes: {' '.join(scopes_with_changes)}[/]\n")
 
-    # Process each scope
     for scope in scopes_with_changes:
         console.print(f"[magenta bold]Processing scope: {scope}[/]")
-        paths = scopes[scope]
-        console.print(f"[cyan]  Paths: {', '.join(paths)}[/]")
-
-        reset_staging()
-
-        scope_files = []
-        status_output = git("status", "--porcelain")
-        for line in status_output.split("\n"):
-            if not line:
-                continue
-            filename = line[3:] if len(line) > 3 else line.split()[-1]
-            for path in paths:
-                if filename.startswith(path):
-                    scope_files.append(filename)
-                    break
-
+        console.print(f"[cyan]  Paths: {', '.join(scopes[scope])}[/]")
+        scope_files = get_files_in_scope(get_changed_files(), scopes[scope])
         if not scope_files:
-            console.print("[dim]  No files found in scope paths[/]")
+            console.print("[dim]  No files found in scope paths[/]\n")
             continue
-
-        console.print("[dim]  Files to stage:[/]")
-        for f in scope_files:
-            console.print(f"[dim]    {f}[/]")
-
-        stage_files(scope_files)
-        diff = git("diff", "--cached")
-        if not diff:
-            console.print(f"[dim]  No changes to commit for {scope}[/]")
-            continue
-
-        with console.status("[magenta]Generating commit message...[/]"):
-            message = generate_commit_message(diff, scope)
-        if not message:
-            continue
-
-        console.print(Panel(message, border_style="magenta"))
-        if confirm(f"Commit changes for {scope}?"):
-            do_commit(message)
-            console.print(f"[green]✓ Committed changes for {scope}[/]")
-        else:
-            console.print(f"[dim]  Skipped {scope}[/]")
-        console.print()
+        commit_group(repo_path, scope_files, scope)
 
     reset_staging()
 
-    # Remaining files
-    remaining = git("status", "--porcelain")
-    if remaining:
-        console.print("\n[yellow]Processing remaining files outside any scope...[/]")
+    # Remaining files outside any scope.
+    if git("status", "--porcelain"):
+        console.print("[yellow]Processing remaining files outside any scope...[/]\n")
 
-        tracked_unstaged = git("diff", "--name-only")
-        if tracked_unstaged:
-            files = [f for f in tracked_unstaged.split("\n") if f]
-            console.print("\n[magenta]Tracked unstaged files:[/]")
-            for f in files:
+        tracked = [f for f in git("diff", "--name-only").split("\n") if f]
+        if tracked:
+            console.print("[magenta]Tracked unstaged files:[/]")
+            for f in tracked:
                 console.print(f"[dim]  {f}[/]")
             if confirm("Commit tracked unstaged files?"):
-                stage_files(files)
-                diff = git("diff", "--cached")
-                with console.status("[magenta]Generating commit message...[/]"):
-                    message = generate_commit_message(diff)
-                if message:
-                    console.print(Panel(message, border_style="magenta"))
-                    do_commit(message)
-                    console.print("[green]✓ Committed tracked unstaged files[/]")
+                commit_group(repo_path, tracked)
 
-        untracked = git("ls-files", "--others", "--exclude-standard")
+        untracked = [f for f in git("ls-files", "--others", "--exclude-standard").split("\n") if f]
         if untracked:
-            files = [f for f in untracked.split("\n") if f]
-            console.print("\n[magenta]Untracked files:[/]")
-            for f in files:
+            console.print("[magenta]Untracked files:[/]")
+            for f in untracked:
                 console.print(f"[dim]  {f}[/]")
             if confirm("Commit untracked files?"):
-                stage_files(files)
-                diff = git("diff", "--cached")
-                with console.status("[magenta]Generating commit message...[/]"):
-                    message = generate_commit_message(diff)
-                if message:
-                    console.print(Panel(message, border_style="magenta"))
-                    do_commit(message)
-                    console.print("[green]✓ Committed untracked files[/]")
+                commit_group(repo_path, untracked)
 
     # Push
     unpushed = get_unpushed_commits()
@@ -783,9 +1055,7 @@ def cmd_commit():
         console.print(f"[cyan]{len(unpushed)} commit(s) ready to push:[/]\n")
         for line in unpushed:
             parts = line.split(" ", 1)
-            hash_val = parts[0]
-            msg = parts[1] if len(parts) > 1 else ""
-            console.print(f"  [bold]{hash_val}[/] {msg}")
+            console.print(f"  [bold]{parts[0]}[/] {parts[1] if len(parts) > 1 else ''}")
         console.print()
         if AUTO_PUSH or confirm("Push commits to origin?"):
             push_to_origin()
