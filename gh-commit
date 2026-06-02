@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# gh-commit: AI-powered scoped git commits, driven by Claude over ACP
+# gh-commit: AI-powered scoped git commits (mods for scopes, Claude ACP for messages)
 # Install: gh extension install prdlk/gh-commit
-# Requires: uv (https://docs.astral.sh/uv), Node.js (for the Claude ACP bridge),
-#           and an authenticated `claude` (https://docs.anthropic.com/en/docs/claude-code)
+# Requires: uv (https://docs.astral.sh/uv), the `mods` CLI (scope generation),
+#           Node.js (for the Claude ACP bridge), and an authenticated `claude`
+#           (https://docs.anthropic.com/en/docs/claude-code)
 
 EXTENSION_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${EXTENSION_DIR}/smartcommit.py"

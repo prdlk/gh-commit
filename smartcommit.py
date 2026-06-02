@@ -7,11 +7,13 @@
 #     "questionary>=2.0.0",
 # ]
 # ///
-"""gh-commit - AI-powered scoped git commits, driven entirely by Claude over ACP.
+"""gh-commit - AI-powered scoped git commits.
 
-A single Claude agent (reached through the Agent Client Protocol) handles both
-scope generation and commit-message writing. Scopes live in a local DuckDB and
-auto-regenerate whenever the repository's .gitignore changes.
+Scope generation runs through the `mods` CLI (the repository's file tree is
+piped into a `scope-identifier` role), which keeps it off Claude's ACP credit
+path. Commit-message writing still uses Claude over the Agent Client Protocol.
+Scopes live in a local DuckDB and auto-regenerate whenever the repository's
+.gitignore changes.
 """
 
 import atexit
@@ -48,6 +50,14 @@ ACP_CMD = os.environ.get(
 ).split()
 ACP_PERMISSION_MODE = os.environ.get("GH_COMMIT_ACP_PERMISSION", "bypassPermissions")
 ACP_TIMEOUT = int(os.environ.get("GH_COMMIT_ACP_TIMEOUT", "300"))
+
+# The `mods` CLI handles scope generation (the repo file tree is piped to a role),
+# keeping it off Claude's ACP credit path.
+MODS_CMD = os.environ.get("GH_COMMIT_MODS_CMD", "mods").split()
+MODS_SCOPE_ROLE = os.environ.get("GH_COMMIT_MODS_SCOPE_ROLE", "scope-identifier")
+MODS_MODEL = os.environ.get("GH_COMMIT_MODS_MODEL", "")  # blank → mods' default-model
+MODS_MAX_TOKENS = os.environ.get("GH_COMMIT_MODS_MAX_TOKENS", "2000")
+MODS_TIMEOUT = int(os.environ.get("GH_COMMIT_MODS_TIMEOUT", "120"))
 
 AUTO_CONFIRM = os.environ.get("GH_COMMIT_AUTO", "0") == "1"
 AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
@@ -300,6 +310,59 @@ def acp_prompt(text: str, cwd: Path) -> str:
         _acp = ACPClient(cwd)
         atexit.register(_acp.close)
     return _acp.prompt(text)
+
+
+# ── mods CLI client (scope generation) ────────────────────────────────────────
+
+class ModsError(RuntimeError):
+    """Raised when the `mods` CLI fails to produce output."""
+
+
+def build_filetree(repo_path: Path) -> str:
+    """Repo-relative file listing respecting .gitignore (tracked + non-ignored)."""
+    tracked = git("ls-files")
+    untracked = git("ls-files", "--others", "--exclude-standard")
+    files = sorted({f for f in (tracked + "\n" + untracked).split("\n") if f})
+    return "\n".join(files)
+
+
+def _mods_mcp_servers() -> list[str]:
+    """Names of MCP servers mods would attach. Disabling them keeps scope
+    generation a plain completion — function-calling models otherwise try to
+    emit the JSON as a (failing) tool call instead of as text."""
+    result = subprocess.run([*MODS_CMD, "--mcp-list"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    names = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line:
+            names.append(line.split()[0])
+    return names
+
+
+def mods_prompt(text: str, role: str, cwd: Path) -> str:
+    """Pipe `text` into the `mods` CLI under `role` and return its raw reply."""
+    cmd = [*MODS_CMD, "-R", role, "-q", "-r", "--no-limit", "--max-tokens", MODS_MAX_TOKENS]
+    if MODS_MODEL:
+        cmd += ["-m", MODS_MODEL]
+    for server in _mods_mcp_servers():
+        cmd += ["--mcp-disable", server]
+    try:
+        result = subprocess.run(
+            cmd, input=text, capture_output=True, text=True,
+            cwd=str(cwd), timeout=MODS_TIMEOUT,
+        )
+    except FileNotFoundError as e:
+        raise ModsError(
+            f"Could not run the mods CLI ({MODS_CMD[0]!r} not found). "
+            "Install mods, or set GH_COMMIT_MODS_CMD to a working command."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise ModsError(f"mods timed out after {MODS_TIMEOUT}s") from e
+    if result.returncode != 0:
+        raise ModsError(result.stderr.strip() or f"mods exited with {result.returncode}")
+    return result.stdout.strip()
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -598,38 +661,22 @@ Requirements:
 {diff}
 """
 
+# The `scope-identifier` mods role carries the output-format rules; these prompt
+# bodies just frame the piped-in file tree.
 SCOPE_PROMPT_NEW = """\
-You are configuring commit "scopes" for this git repository at {cwd}.
+Repository file tree (one repo-relative path per line):
 
-Inspect the repository's directory structure and key files, then map logical
-project areas to the paths they cover.
-
-Rules:
-- Scope names must read well in Conventional Commits: e.g. core, api, ui, cli,
-  docs, tests, ci, config, scripts, deps.
-- Each scope maps to an array of repo-relative path prefixes (directories or files).
-- Cover the meaningful source areas and group related paths together.
-- Respect .gitignore: never create scopes for ignored, generated, or vendored paths.
-- Output ONLY a single JSON object of the form {{"scope": ["path", ...], ...}}.
-  No prose, no markdown fences.
+{filetree}
 """
 
 SCOPE_PROMPT_UPDATE = """\
-You are updating the commit "scopes" for this git repository at {cwd}.
-
-Current scopes (JSON):
+Existing scopes (JSON):
 {existing}
 
-Re-inspect the repository's current structure (it may have changed, e.g. its
-.gitignore was edited) and produce an updated mapping.
+The repository structure may have changed (e.g. its .gitignore was edited).
+Updated repository file tree (one repo-relative path per line):
 
-Rules:
-- Keep scopes that still make sense; drop ones whose paths no longer exist.
-- Add scopes for new meaningful areas.
-- Scope names must read well in Conventional Commits.
-- Respect .gitignore: never create scopes for ignored, generated, or vendored paths.
-- Output ONLY a single JSON object of the form {{"scope": ["path", ...], ...}}.
-  No prose, no markdown fences.
+{filetree}
 """
 
 
@@ -682,19 +729,23 @@ def generate_commit_message(diff: str, repo_path: Path, scope: Optional[str] = N
 
 
 def generate_scopes(repo_path: Path, existing: Optional[dict[str, list[str]]] = None) -> Optional[dict[str, list[str]]]:
+    filetree = build_filetree(repo_path)
+    if not filetree:
+        console.print("[red]No tracked or untracked files to analyze[/]")
+        return None
     if existing:
-        prompt = SCOPE_PROMPT_UPDATE.format(cwd=repo_path, existing=json.dumps(existing, indent=2))
+        prompt = SCOPE_PROMPT_UPDATE.format(existing=json.dumps(existing, indent=2), filetree=filetree)
     else:
-        prompt = SCOPE_PROMPT_NEW.format(cwd=repo_path)
+        prompt = SCOPE_PROMPT_NEW.format(filetree=filetree)
     try:
-        with console.status("[magenta]Analyzing repository with Claude (ACP)...[/]"):
-            output = acp_prompt(prompt, repo_path)
-    except ACPError as e:
-        console.print(f"[red]Claude (ACP) failed: {e}[/]")
+        with console.status("[magenta]Analyzing repository with mods...[/]"):
+            output = mods_prompt(prompt, MODS_SCOPE_ROLE, repo_path)
+    except ModsError as e:
+        console.print(f"[red]mods failed: {e}[/]")
         return None
     scopes = parse_scopes_response(output)
     if not scopes:
-        console.print("[red]Could not parse scopes from Claude's response[/]")
+        console.print("[red]Could not parse scopes from mods' response[/]")
         if DEBUG:
             console.print(f"[dim]{output}[/]")
     return scopes
@@ -811,7 +862,7 @@ def cmd_version():
 
 
 def cmd_help():
-    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (Claude ACP)\n")
+    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (mods scopes · Claude ACP messages)\n")
     console.print("[cyan]Usage:[/]")
     console.print("  gh commit                  Commit changes grouped by scope")
     console.print("  gh commit --auto           Auto-confirm all prompts")
@@ -831,8 +882,11 @@ def cmd_help():
     console.print("  GH_COMMIT_AUTO=1           Skip all confirmation prompts")
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
     console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
-    console.print("  GH_COMMIT_ACP_CMD=...      Override the Claude ACP bridge command")
+    console.print("  GH_COMMIT_ACP_CMD=...      Override the Claude ACP bridge command (commit messages)")
     console.print("  GH_COMMIT_ACP_PERMISSION=  ACP permission mode (default bypassPermissions)")
+    console.print("  GH_COMMIT_MODS_CMD=...     Override the mods command (scope generation)")
+    console.print("  GH_COMMIT_MODS_SCOPE_ROLE= mods role for scopes (default scope-identifier)")
+    console.print("  GH_COMMIT_MODS_MODEL=...   Override the mods model (default: mods' default-model)")
     console.print("  GH_COMMIT_DEBUG=1          Show ACP bridge stderr / parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
