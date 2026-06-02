@@ -9,21 +9,19 @@
 # ///
 """gh-commit - AI-powered scoped git commits.
 
-Scope generation runs through the `mods` CLI (the repository's file tree is
-piped into a `scope-identifier` role), which keeps it off Claude's ACP credit
-path. Commit-message writing still uses Claude over the Agent Client Protocol.
-Scopes live in a local DuckDB and auto-regenerate whenever the repository's
-.gitignore changes.
+Both AI steps run through the `mods` CLI, so the tool never touches Claude's
+ACP credit path: scope generation pipes the repository's file tree into a
+`scope-identifier` role, and commit-message writing pipes the staged diff into
+a `write-commit` role. Scopes live in a local DuckDB and auto-regenerate
+whenever the repository's .gitignore changes.
 """
 
-import atexit
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-import threading
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -43,18 +41,11 @@ console = Console()
 DB_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "gh-commit"
 DB_PATH = DB_DIR / "gh-commit.db"
 
-# The ACP bridge that exposes Claude Code as an Agent Client Protocol server.
-ACP_CMD = os.environ.get(
-    "GH_COMMIT_ACP_CMD",
-    "npx --yes @zed-industries/claude-code-acp",
-).split()
-ACP_PERMISSION_MODE = os.environ.get("GH_COMMIT_ACP_PERMISSION", "bypassPermissions")
-ACP_TIMEOUT = int(os.environ.get("GH_COMMIT_ACP_TIMEOUT", "300"))
-
-# The `mods` CLI handles scope generation (the repo file tree is piped to a role),
-# keeping it off Claude's ACP credit path.
+# The `mods` CLI handles both AI steps (a prompt is piped to a predefined role),
+# keeping the tool off Claude's ACP credit path.
 MODS_CMD = os.environ.get("GH_COMMIT_MODS_CMD", "mods").split()
 MODS_SCOPE_ROLE = os.environ.get("GH_COMMIT_MODS_SCOPE_ROLE", "scope-identifier")
+MODS_COMMIT_ROLE = os.environ.get("GH_COMMIT_MODS_COMMIT_ROLE", "write-commit")
 MODS_MODEL = os.environ.get("GH_COMMIT_MODS_MODEL", "")  # blank → mods' default-model
 MODS_MAX_TOKENS = os.environ.get("GH_COMMIT_MODS_MAX_TOKENS", "2000")
 MODS_TIMEOUT = int(os.environ.get("GH_COMMIT_MODS_TIMEOUT", "120"))
@@ -108,211 +99,7 @@ def require_git() -> Path:
     return get_repo_root()
 
 
-# ── Claude ACP client ───────────────────────────────────────────────────────────
-
-class ACPError(RuntimeError):
-    """Raised when the ACP bridge or the underlying Claude agent fails."""
-
-
-class ACPClient:
-    """Minimal Agent Client Protocol client speaking newline-delimited JSON-RPC
-    to a Claude Code ACP bridge subprocess.
-
-    One bridge process is reused for the life of the run; every prompt gets a
-    fresh session so individual generations never bleed context into each other.
-    """
-
-    def __init__(self, cwd: Path):
-        self.cwd = str(cwd)
-        self._proc: Optional[subprocess.Popen] = None
-        self._pending: dict[int, dict] = {}
-        self._next_id = 0
-        self._lock = threading.Lock()
-        self._chunks: list[str] = []
-        self._active_session: Optional[str] = None
-
-    # -- lifecycle --------------------------------------------------------------
-
-    def _ensure_started(self):
-        if self._proc is not None:
-            return
-        env = dict(os.environ)
-        # The bridge launches a nested Claude Code; clear markers that would make
-        # it refuse to start when gh-commit itself is run from inside Claude Code.
-        for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
-            env.pop(key, None)
-        env.setdefault("ACP_PERMISSION_MODE", ACP_PERMISSION_MODE)
-
-        stderr = None if DEBUG else subprocess.DEVNULL
-        try:
-            self._proc = subprocess.Popen(
-                ACP_CMD,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                text=True,
-                bufsize=1,
-                cwd=self.cwd,
-                env=env,
-            )
-        except FileNotFoundError as e:
-            raise ACPError(
-                f"Could not launch ACP bridge ({ACP_CMD[0]!r} not found). "
-                "Install Node.js, or set GH_COMMIT_ACP_CMD to a working bridge."
-            ) from e
-
-        threading.Thread(target=self._reader, daemon=True).start()
-        self._initialize()
-
-    def close(self):
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-        self._proc = None
-
-    # -- transport --------------------------------------------------------------
-
-    def _write(self, msg: dict):
-        if not self._proc or not self._proc.stdin:
-            raise ACPError("ACP bridge is not running")
-        self._proc.stdin.write(json.dumps(msg) + "\n")
-        self._proc.stdin.flush()
-
-    def _send_request(self, method: str, params: dict) -> int:
-        with self._lock:
-            rid = self._next_id
-            self._next_id += 1
-            self._pending[rid] = {"event": threading.Event(), "result": None, "error": None}
-        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        return rid
-
-    def _respond(self, rid, result=None, error=None):
-        msg = {"jsonrpc": "2.0", "id": rid}
-        if error is not None:
-            msg["error"] = error
-        else:
-            msg["result"] = result if result is not None else {}
-        self._write(msg)
-
-    def _reader(self):
-        proc = self._proc
-        if not proc or not proc.stdout:
-            return
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            self._dispatch(msg)
-        # Stream closed: unblock anything still waiting.
-        for p in self._pending.values():
-            if p["error"] is None and p["result"] is None:
-                p["error"] = {"message": "ACP bridge closed the connection"}
-            p["event"].set()
-
-    def _dispatch(self, msg: dict):
-        # Response to one of our requests.
-        if "id" in msg and ("result" in msg or "error" in msg):
-            p = self._pending.get(msg["id"])
-            if p:
-                p["result"], p["error"] = msg.get("result"), msg.get("error")
-                p["event"].set()
-            return
-        # Request from the agent that needs a reply.
-        if "method" in msg and "id" in msg:
-            self._on_agent_request(msg)
-            return
-        # One-way notification.
-        if msg.get("method") == "session/update":
-            self._on_update(msg.get("params", {}))
-
-    def _on_agent_request(self, msg: dict):
-        method = msg["method"]
-        params = msg.get("params", {})
-        if method == "session/request_permission":
-            options = params.get("options", [])
-            choice = next(
-                (o["optionId"] for o in options if "allow" in o.get("optionId", "").lower()),
-                options[0]["optionId"] if options else "allow",
-            )
-            self._respond(msg["id"], {"outcome": {"outcome": "selected", "optionId": choice}})
-        elif method == "fs/read_text_file":
-            try:
-                self._respond(msg["id"], {"content": Path(params["path"]).read_text()})
-            except Exception as e:
-                self._respond(msg["id"], error={"code": -32603, "message": str(e)})
-        else:
-            # We advertise no client-side capabilities; decline anything else.
-            self._respond(msg["id"], error={"code": -32601, "message": "unsupported"})
-
-    def _on_update(self, params: dict):
-        if params.get("sessionId") and params["sessionId"] != self._active_session:
-            return
-        update = params.get("update", {})
-        kind = update.get("sessionUpdate") or update.get("type")
-        if kind == "agent_message_chunk":
-            content = update.get("content", {})
-            if content.get("type") == "text":
-                self._chunks.append(content.get("text", ""))
-
-    def _call(self, method: str, params: dict, timeout: int) -> dict:
-        rid = self._send_request(method, params)
-        p = self._pending[rid]
-        if not p["event"].wait(timeout):
-            self._pending.pop(rid, None)
-            raise ACPError(f"ACP request timed out: {method}")
-        self._pending.pop(rid, None)
-        if p["error"]:
-            raise ACPError(p["error"].get("message", str(p["error"])))
-        return p["result"] or {}
-
-    # -- protocol ---------------------------------------------------------------
-
-    def _initialize(self):
-        self._call("initialize", {
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {"readTextFile": False, "writeTextFile": False},
-                "terminal": False,
-            },
-            "clientInfo": {"name": "gh-commit", "version": VERSION},
-        }, timeout=60)
-
-    def prompt(self, text: str) -> str:
-        """Run one prompt in a fresh session and return the agent's text reply."""
-        self._ensure_started()
-        session = self._call("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=120)
-        sid = session.get("sessionId")
-        if not sid:
-            raise ACPError("ACP bridge did not return a session id")
-        with self._lock:
-            self._chunks = []
-            self._active_session = sid
-        self._call("session/prompt", {
-            "sessionId": sid,
-            "prompt": [{"type": "text", "text": text}],
-        }, timeout=ACP_TIMEOUT)
-        return "".join(self._chunks).strip()
-
-
-_acp: Optional[ACPClient] = None
-
-
-def acp_prompt(text: str, cwd: Path) -> str:
-    """Send a prompt to the shared Claude ACP client, starting it on first use."""
-    global _acp
-    if _acp is None:
-        _acp = ACPClient(cwd)
-        atexit.register(_acp.close)
-    return _acp.prompt(text)
-
-
-# ── mods CLI client (scope generation) ────────────────────────────────────────
+# ── mods CLI client ───────────────────────────────────────────────────────────
 
 class ModsError(RuntimeError):
     """Raised when the `mods` CLI fails to produce output."""
@@ -645,19 +432,12 @@ def filter_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-# ── AI integration (Claude over ACP) ─────────────────────────────────────────────
+# ── AI integration (mods CLI) ─────────────────────────────────────────────────
 
+# The `write-commit` mods role carries the Conventional Commits format rules;
+# this body just supplies the scope to use and the diff to describe.
 COMMIT_PROMPT = """\
-Write a single Conventional Commits message for the staged changes shown below.
-
-Requirements:
-- Format: type(scope): summary  (e.g. feat, fix, docs, refactor, chore, test, ci)
-- Keep the summary under ~70 characters, imperative mood, no trailing period.
-- Optionally add a blank line then a concise body explaining the "why" (wrap ~72 cols).
-- Base the message ONLY on the diff below — do not invoke any tools.
-- Output ONLY the commit message. No code fences, no preamble, no commentary.
-{scope_hint}
-### Git Diff
+{scope_hint}### Git Diff
 {diff}
 """
 
@@ -716,12 +496,12 @@ def parse_scopes_response(text: str) -> Optional[dict[str, list[str]]]:
 
 
 def generate_commit_message(diff: str, repo_path: Path, scope: Optional[str] = None) -> Optional[str]:
-    scope_hint = f"- Use this scope: {scope}\n" if scope else ""
+    scope_hint = f"Use this scope: {scope}\n" if scope else ""
     prompt = COMMIT_PROMPT.format(scope_hint=scope_hint, diff=filter_diff(diff))
     try:
-        message = acp_prompt(prompt, repo_path)
-    except ACPError as e:
-        console.print(f"[red]Claude (ACP) failed to generate a commit message: {e}[/]")
+        message = mods_prompt(prompt, MODS_COMMIT_ROLE, repo_path)
+    except ModsError as e:
+        console.print(f"[red]mods failed to generate a commit message: {e}[/]")
         return None
     # Strip stray code fences if the model added them anyway.
     message = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", message.strip()).strip()
@@ -862,7 +642,7 @@ def cmd_version():
 
 
 def cmd_help():
-    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (mods scopes · Claude ACP messages)\n")
+    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (mods)\n")
     console.print("[cyan]Usage:[/]")
     console.print("  gh commit                  Commit changes grouped by scope")
     console.print("  gh commit --auto           Auto-confirm all prompts")
@@ -882,12 +662,11 @@ def cmd_help():
     console.print("  GH_COMMIT_AUTO=1           Skip all confirmation prompts")
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
     console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
-    console.print("  GH_COMMIT_ACP_CMD=...      Override the Claude ACP bridge command (commit messages)")
-    console.print("  GH_COMMIT_ACP_PERMISSION=  ACP permission mode (default bypassPermissions)")
-    console.print("  GH_COMMIT_MODS_CMD=...     Override the mods command (scope generation)")
+    console.print("  GH_COMMIT_MODS_CMD=...     Override the mods command")
     console.print("  GH_COMMIT_MODS_SCOPE_ROLE= mods role for scopes (default scope-identifier)")
+    console.print("  GH_COMMIT_MODS_COMMIT_ROLE= mods role for commit messages (default write-commit)")
     console.print("  GH_COMMIT_MODS_MODEL=...   Override the mods model (default: mods' default-model)")
-    console.print("  GH_COMMIT_DEBUG=1          Show ACP bridge stderr / parse diagnostics\n")
+    console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
 
