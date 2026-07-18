@@ -46,7 +46,8 @@ DB_PATH = DB_DIR / "gh-commit.db"
 MODS_CMD = os.environ.get("GH_COMMIT_MODS_CMD", "mods").split()
 MODS_SCOPE_ROLE = os.environ.get("GH_COMMIT_MODS_SCOPE_ROLE", "scope-identifier")
 MODS_COMMIT_ROLE = os.environ.get("GH_COMMIT_MODS_COMMIT_ROLE", "write-commit")
-MODS_MODEL = os.environ.get("GH_COMMIT_MODS_MODEL", "")  # blank → mods' default-model
+MODS_API = os.environ.get("GH_COMMIT_MODS_API", "openrouter")
+MODS_MODEL = os.environ.get("GH_COMMIT_MODS_MODEL", "qwen/qwen3.6-27b")
 MODS_MAX_TOKENS = os.environ.get("GH_COMMIT_MODS_MAX_TOKENS", "2000")
 MODS_TIMEOUT = int(os.environ.get("GH_COMMIT_MODS_TIMEOUT", "120"))
 
@@ -131,6 +132,8 @@ def _mods_mcp_servers() -> list[str]:
 def mods_prompt(text: str, role: str, cwd: Path) -> str:
     """Pipe `text` into the `mods` CLI under `role` and return its raw reply."""
     cmd = [*MODS_CMD, "-R", role, "-q", "-r", "--no-limit", "--max-tokens", MODS_MAX_TOKENS]
+    if MODS_API:
+        cmd += ["-a", MODS_API]
     if MODS_MODEL:
         cmd += ["-m", MODS_MODEL]
     for server in _mods_mcp_servers():
@@ -665,7 +668,8 @@ def cmd_help():
     console.print("  GH_COMMIT_MODS_CMD=...     Override the mods command")
     console.print("  GH_COMMIT_MODS_SCOPE_ROLE= mods role for scopes (default scope-identifier)")
     console.print("  GH_COMMIT_MODS_COMMIT_ROLE= mods role for commit messages (default write-commit)")
-    console.print("  GH_COMMIT_MODS_MODEL=...   Override the mods model (default: mods' default-model)")
+    console.print("  GH_COMMIT_MODS_API=...     Override the mods API (default: openrouter)")
+    console.print("  GH_COMMIT_MODS_MODEL=...   Override the mods model (default: qwen/qwen3.6-27b)")
     console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
