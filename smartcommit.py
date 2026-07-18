@@ -9,10 +9,10 @@
 # ///
 """gh-commit - AI-powered scoped git commits.
 
-Both AI steps run through the `mods` CLI, so the tool never touches Claude's
-ACP credit path: scope generation pipes the repository's file tree into a
-`scope-identifier` role, and commit-message writing pipes the staged diff into
-a `write-commit` role. Scopes live in a local DuckDB and auto-regenerate
+Both AI steps run through `crush run`: scope generation sends the repository's
+file tree with embedded scope-identification instructions, and commit-message
+writing sends the staged diff with embedded Conventional Commits instructions.
+Scopes live in a local DuckDB and auto-regenerate
 whenever the repository's .gitignore changes.
 """
 
@@ -41,15 +41,11 @@ console = Console()
 DB_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "gh-commit"
 DB_PATH = DB_DIR / "gh-commit.db"
 
-# The `mods` CLI handles both AI steps (a prompt is piped to a predefined role),
-# keeping the tool off Claude's ACP credit path.
-MODS_CMD = os.environ.get("GH_COMMIT_MODS_CMD", "mods").split()
-MODS_SCOPE_ROLE = os.environ.get("GH_COMMIT_MODS_SCOPE_ROLE", "scope-identifier")
-MODS_COMMIT_ROLE = os.environ.get("GH_COMMIT_MODS_COMMIT_ROLE", "write-commit")
-MODS_API = os.environ.get("GH_COMMIT_MODS_API", "openrouter")
-MODS_MODEL = os.environ.get("GH_COMMIT_MODS_MODEL", "qwen/qwen3.6-27b")
-MODS_MAX_TOKENS = os.environ.get("GH_COMMIT_MODS_MAX_TOKENS", "2000")
-MODS_TIMEOUT = int(os.environ.get("GH_COMMIT_MODS_TIMEOUT", "120"))
+# Crush handles both AI steps in non-interactive mode. The instructions formerly
+# stored as mods roles are embedded below so this tool is self-contained.
+CRUSH_CMD = os.environ.get("GH_COMMIT_CRUSH_CMD", "crush").split()
+CRUSH_MODEL = os.environ.get("GH_COMMIT_CRUSH_MODEL", "openrouter/qwen/qwen3.6-27b")
+CRUSH_TIMEOUT = int(os.environ.get("GH_COMMIT_CRUSH_TIMEOUT", "120"))
 
 AUTO_CONFIRM = os.environ.get("GH_COMMIT_AUTO", "0") == "1"
 AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
@@ -100,10 +96,10 @@ def require_git() -> Path:
     return get_repo_root()
 
 
-# ── mods CLI client ───────────────────────────────────────────────────────────
+# ── Crush CLI client ──────────────────────────────────────────────────────────
 
-class ModsError(RuntimeError):
-    """Raised when the `mods` CLI fails to produce output."""
+class CrushError(RuntimeError):
+    """Raised when `crush run` fails to produce output."""
 
 
 def build_filetree(repo_path: Path) -> str:
@@ -114,44 +110,25 @@ def build_filetree(repo_path: Path) -> str:
     return "\n".join(files)
 
 
-def _mods_mcp_servers() -> list[str]:
-    """Names of MCP servers mods would attach. Disabling them keeps scope
-    generation a plain completion — function-calling models otherwise try to
-    emit the JSON as a (failing) tool call instead of as text."""
-    result = subprocess.run([*MODS_CMD, "--mcp-list"], capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-    names = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line:
-            names.append(line.split()[0])
-    return names
-
-
-def mods_prompt(text: str, role: str, cwd: Path) -> str:
-    """Pipe `text` into the `mods` CLI under `role` and return its raw reply."""
-    cmd = [*MODS_CMD, "-R", role, "-q", "-r", "--no-limit", "--max-tokens", MODS_MAX_TOKENS]
-    if MODS_API:
-        cmd += ["-a", MODS_API]
-    if MODS_MODEL:
-        cmd += ["-m", MODS_MODEL]
-    for server in _mods_mcp_servers():
-        cmd += ["--mcp-disable", server]
+def crush_prompt(text: str, cwd: Path) -> str:
+    """Send `text` to `crush run` and return its reply."""
+    cmd = [*CRUSH_CMD, "run", "--quiet"]
+    if CRUSH_MODEL:
+        cmd += ["--model", CRUSH_MODEL]
     try:
         result = subprocess.run(
             cmd, input=text, capture_output=True, text=True,
-            cwd=str(cwd), timeout=MODS_TIMEOUT,
+            cwd=str(cwd), timeout=CRUSH_TIMEOUT,
         )
     except FileNotFoundError as e:
-        raise ModsError(
-            f"Could not run the mods CLI ({MODS_CMD[0]!r} not found). "
-            "Install mods, or set GH_COMMIT_MODS_CMD to a working command."
+        raise CrushError(
+            f"Could not run the Crush CLI ({CRUSH_CMD[0]!r} not found). "
+            "Install Crush, or set GH_COMMIT_CRUSH_CMD to a working command."
         ) from e
     except subprocess.TimeoutExpired as e:
-        raise ModsError(f"mods timed out after {MODS_TIMEOUT}s") from e
+        raise CrushError(f"crush run timed out after {CRUSH_TIMEOUT}s") from e
     if result.returncode != 0:
-        raise ModsError(result.stderr.strip() or f"mods exited with {result.returncode}")
+        raise CrushError(result.stderr.strip() or f"crush run exited with {result.returncode}")
     return result.stdout.strip()
 
 
@@ -435,24 +412,53 @@ def filter_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-# ── AI integration (mods CLI) ─────────────────────────────────────────────────
+# ── AI integration (Crush CLI) ────────────────────────────────────────────────
 
-# The `write-commit` mods role carries the Conventional Commits format rules;
-# this body just supplies the scope to use and the diff to describe.
 COMMIT_PROMPT = """\
+You are an expert conventional commit message writer.
+Use one of these commit types: feat, fix, docs, style, refactor, breaking, test, perf, build, ci, chore, init.
+Determine a precise commit message from the provided diff and scope.
+The commit message must follow this format: <type>(<scope>): <description>
+Examples:
+- fix(core): resolve consensus timeout during high load
+- feat(did): add WebAuthn biometric authentication support
+- refactor(hway): extract Redis connection pooling to shared utility
+- init(browser): setup client package for web API-specific logic
+- perf(vault): optimize IPFS chunk size for large file uploads
+- ci(actions): update GitHub Actions pipeline for parallel module testing
+- docs(dwn): clarify data retention policies in API reference
+- test(svc): add integration tests for domain verification flow
+- breaking(ui): rename Button prop 'type' to 'variant'
+- refactor(sdk): migrate off wallet implementation in favor of @sonr.io/enclave
+- feat(react): create Enclave stateful hooks
+Never explain anything. Return only the commit message.
+
 {scope_hint}### Git Diff
 {diff}
 """
 
-# The `scope-identifier` mods role carries the output-format rules; these prompt
-# bodies just frame the piped-in file tree.
-SCOPE_PROMPT_NEW = """\
+SCOPE_INSTRUCTIONS = """\
+You are a repository scope identifier for Conventional Commits.
+You receive a repository file tree, one repo-relative path per line.
+Map logical project areas to the repo-relative path prefixes (directories or files) they cover.
+Scope names must read well in Conventional Commits, e.g. core, api, ui, cli, docs, tests, ci, config, scripts, deps.
+Each scope maps to a JSON array of repo-relative path prefixes.
+Group related paths together and cover the meaningful source areas.
+Never create scopes for generated, vendored, or build-output paths.
+If existing scopes are provided, keep the ones that still apply, drop scopes whose paths no longer exist, and add scopes for new areas.
+Never explain anything or print your thoughts. Never include Markdown code blocks.
+Only return a single JSON object of the form {{"scope": ["path", ...], ...}}.
+"""
+
+SCOPE_PROMPT_NEW = SCOPE_INSTRUCTIONS + """
+
 Repository file tree (one repo-relative path per line):
 
 {filetree}
 """
 
-SCOPE_PROMPT_UPDATE = """\
+SCOPE_PROMPT_UPDATE = SCOPE_INSTRUCTIONS + """
+
 Existing scopes (JSON):
 {existing}
 
@@ -502,9 +508,9 @@ def generate_commit_message(diff: str, repo_path: Path, scope: Optional[str] = N
     scope_hint = f"Use this scope: {scope}\n" if scope else ""
     prompt = COMMIT_PROMPT.format(scope_hint=scope_hint, diff=filter_diff(diff))
     try:
-        message = mods_prompt(prompt, MODS_COMMIT_ROLE, repo_path)
-    except ModsError as e:
-        console.print(f"[red]mods failed to generate a commit message: {e}[/]")
+        message = crush_prompt(prompt, repo_path)
+    except CrushError as e:
+        console.print(f"[red]Crush failed to generate a commit message: {e}[/]")
         return None
     # Strip stray code fences if the model added them anyway.
     message = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", message.strip()).strip()
@@ -521,14 +527,14 @@ def generate_scopes(repo_path: Path, existing: Optional[dict[str, list[str]]] = 
     else:
         prompt = SCOPE_PROMPT_NEW.format(filetree=filetree)
     try:
-        with console.status("[magenta]Analyzing repository with mods...[/]"):
-            output = mods_prompt(prompt, MODS_SCOPE_ROLE, repo_path)
-    except ModsError as e:
-        console.print(f"[red]mods failed: {e}[/]")
+        with console.status("[magenta]Analyzing repository with Crush...[/]"):
+            output = crush_prompt(prompt, repo_path)
+    except CrushError as e:
+        console.print(f"[red]Crush failed: {e}[/]")
         return None
     scopes = parse_scopes_response(output)
     if not scopes:
-        console.print("[red]Could not parse scopes from mods' response[/]")
+        console.print("[red]Could not parse scopes from Crush's response[/]")
         if DEBUG:
             console.print(f"[dim]{output}[/]")
     return scopes
@@ -626,7 +632,7 @@ def maybe_auto_refresh_scopes(repo_path: Path, repo_name: str):
     if current == stored:
         return
 
-    console.print("[yellow]↻ .gitignore changed — regenerating scopes with Claude...[/]")
+    console.print("[yellow]↻ .gitignore changed — regenerating scopes with Crush...[/]")
     existing = get_repo_scopes(str(repo_path))
     scopes = generate_scopes(repo_path, existing)
     if not scopes:
@@ -645,7 +651,7 @@ def cmd_version():
 
 
 def cmd_help():
-    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (mods)\n")
+    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (Crush)\n")
     console.print("[cyan]Usage:[/]")
     console.print("  gh commit                  Commit changes grouped by scope")
     console.print("  gh commit --auto           Auto-confirm all prompts")
@@ -665,11 +671,9 @@ def cmd_help():
     console.print("  GH_COMMIT_AUTO=1           Skip all confirmation prompts")
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
     console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
-    console.print("  GH_COMMIT_MODS_CMD=...     Override the mods command")
-    console.print("  GH_COMMIT_MODS_SCOPE_ROLE= mods role for scopes (default scope-identifier)")
-    console.print("  GH_COMMIT_MODS_COMMIT_ROLE= mods role for commit messages (default write-commit)")
-    console.print("  GH_COMMIT_MODS_API=...     Override the mods API (default: openrouter)")
-    console.print("  GH_COMMIT_MODS_MODEL=...   Override the mods model (default: qwen/qwen3.6-27b)")
+    console.print("  GH_COMMIT_CRUSH_CMD=...    Override the Crush command")
+    console.print("  GH_COMMIT_CRUSH_MODEL=...  Override the Crush model (default: openrouter/qwen/qwen3.6-27b)")
+    console.print("  GH_COMMIT_CRUSH_TIMEOUT=...  Per-prompt timeout in seconds (default: 120)")
     console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
@@ -830,7 +834,7 @@ def cmd_commit():
     if not repo_has_scopes(str(repo_path)):
         console.print("\n[yellow bold]⚠ No scopes configured for this repository[/]\n")
         console.print("[cyan]gh-commit organizes commits by project areas (scopes).[/]\n")
-        if confirm("Generate scopes now using Claude?"):
+        if confirm("Generate scopes now using Crush?"):
             if cmd_init() != 0:
                 return 1
         else:
