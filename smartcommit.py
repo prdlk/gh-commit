@@ -44,7 +44,9 @@ DB_PATH = DB_DIR / "gh-commit.db"
 # Crush handles both AI steps in non-interactive mode. The instructions formerly
 # stored as mods roles are embedded below so this tool is self-contained.
 CRUSH_CMD = os.environ.get("GH_COMMIT_CRUSH_CMD", "crush").split()
-CRUSH_MODEL = os.environ.get("GH_COMMIT_CRUSH_MODEL", "openrouter/qwen/qwen3.6-27b")
+DEFAULT_CRUSH_MODEL = "groq/openai/gpt-oss-120b"
+CRUSH_MODEL = os.environ.get("GH_COMMIT_CRUSH_MODEL", DEFAULT_CRUSH_MODEL)
+CRUSH_CONFIG_DIR = Path(__file__).with_name("crush-provider")
 CRUSH_TIMEOUT = int(os.environ.get("GH_COMMIT_CRUSH_TIMEOUT", "120"))
 
 AUTO_CONFIRM = os.environ.get("GH_COMMIT_AUTO", "0") == "1"
@@ -115,9 +117,12 @@ def crush_prompt(text: str, cwd: Path) -> str:
     cmd = [*CRUSH_CMD, "run", "--quiet"]
     if CRUSH_MODEL:
         cmd += ["--model", CRUSH_MODEL]
+    env = os.environ.copy()
+    if CRUSH_MODEL == DEFAULT_CRUSH_MODEL:
+        env.setdefault("CRUSH_GLOBAL_CONFIG", str(CRUSH_CONFIG_DIR))
     try:
         result = subprocess.run(
-            cmd, input=text, capture_output=True, text=True,
+            cmd, input=text, capture_output=True, text=True, env=env,
             cwd=str(cwd), timeout=CRUSH_TIMEOUT,
         )
     except FileNotFoundError as e:
@@ -672,7 +677,7 @@ def cmd_help():
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
     console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
     console.print("  GH_COMMIT_CRUSH_CMD=...    Override the Crush command")
-    console.print("  GH_COMMIT_CRUSH_MODEL=...  Override the Crush model (default: openrouter/qwen/qwen3.6-27b)")
+    console.print(f"  GH_COMMIT_CRUSH_MODEL=...  Override the Crush model (default: {DEFAULT_CRUSH_MODEL})")
     console.print("  GH_COMMIT_CRUSH_TIMEOUT=...  Per-prompt timeout in seconds (default: 120)")
     console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
