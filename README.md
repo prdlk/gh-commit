@@ -1,91 +1,87 @@
 # gh-commit
 
-AI-powered scoped git commits. Groups changes by project area, generates commit messages with `crush run`, and pushes — all in one command.
+AI-powered scoped git commits as a GitHub CLI extension, driven by a local
+Ollama model. Scopes map Conventional Commit scope names to path prefixes.
+They are generated from the repository file tree, stored in a local SQLite
+database, and auto-regenerate whenever `.gitignore` changes. Changed files are
+grouped by scope and committed one scope at a time with generated
+`type(scope): message` subjects.
 
 ## Install
 
 ```sh
+# Prerequisites: git, a running Ollama server, and the model
+ollama pull qwen3.5:2b
+
 gh extension install prdlk/gh-commit
 ```
-
-### Requirements
-
-- [uv](https://docs.astral.sh/uv) — Python package runner (handles dependencies automatically)
-- [Crush](https://github.com/charmbracelet/crush) — non-interactive AI runner
-- `GROQ_API_KEY` — authenticates the default Groq model
-
-By default, gh-commit uses Groq's `openai/gpt-oss-120b`. Override the model with `GH_COMMIT_CRUSH_MODEL`.
 
 ## Usage
 
 ```sh
-# Initialize scopes for your repo (uses Crush to analyze structure)
-gh commit init
-
-# Commit changes grouped by scope
-gh commit
-
-# Auto-confirm + auto-push
-gh commit --auto --push
-
-# Manually refresh scopes after structural changes
-gh commit refresh
-
-# Sync scopes as GitHub labels
-gh commit sync
+cd your-repo
+gh commit init   # generate scopes for this repo
+gh commit        # commit changes grouped by scope
 ```
-
-## How it works
-
-1. **`gh commit init`** — `crush run` analyzes your repo structure and generates scope definitions (e.g., `core → src/`, `docs → docs/, README.md`, `ci → .github/workflows/`)
-2. **`gh commit`** — Groups dirty files by scope, sends each staged diff to `crush run`, and commits each group separately
-3. **Auto-refresh** — Whenever your `.gitignore` changes, scopes are automatically regenerated before committing (a content hash of `.gitignore` is tracked per repo)
-4. Remaining unscoped files are handled in a final pass
-5. Unpushed commits are offered for push
-
-Scopes are stored in a local DuckDB database (`~/.local/share/gh-commit/gh-commit.db`) — no config files in your repo.
-
-### Why Crush?
-
-The former Mods roles now live directly in `smartcommit.py`, so gh-commit no longer depends on Mods configuration. Each generation invokes Crush's supported non-interactive mode with a self-contained prompt.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `gh commit` | Commit changes grouped by scope |
-| `gh commit init` | Generate scopes for current repo |
-| `gh commit refresh` | Update scopes from current structure |
-| `gh commit sync` | Sync scopes → GitHub labels |
-| `gh commit list` | List all configured repositories |
-| `gh commit remove` | Remove current repo from database |
-| `gh commit db-path` | Print database file path |
-| `gh commit version` | Print version |
-| `gh commit help` | Show help |
+| Command | Behavior |
+|---|---|
+| `gh commit` | Full scoped-commit flow: group changed files by scope, generate a message per group, confirm, commit, offer to push |
+| `gh commit init` | Generate scopes from the file tree via Ollama; migrates legacy configs; confirms overwrite |
+| `gh commit refresh` | Show current scopes, regenerate with existing scopes as context, confirm apply |
+| `gh commit sync` | Create/update GitHub labels from scopes (color = first 6 hex chars of MD5 of the scope name) |
+| `gh commit list` | Table of configured repositories: name, path, scope count |
+| `gh commit remove` | Delete the current repo from the database after confirmation |
+| `gh commit db-path` | Print the database file path |
+| `gh commit version` | Print `gh-commit <version>` |
+| `gh commit help` | Help, including the DB path and environment variable docs |
 
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| `--auto` | Skip all confirmation prompts |
-| `--push` | Auto-push after committing |
+Flags: `--auto` (skip confirmations), `--push` (auto-push), `--model`, `--host`.
 
 ## Environment
 
-| Variable | Description |
-|----------|-------------|
-| `GH_COMMIT_AUTO=1` | Skip all confirmation prompts |
-| `GH_COMMIT_PUSH=1` | Auto-push after commits |
-| `GH_COMMIT_NO_AUTO_REFRESH=1` | Don't auto-regenerate scopes when `.gitignore` changes |
-| `GH_COMMIT_CRUSH_CMD` | Override the Crush command (default `crush`) |
-| `GH_COMMIT_CRUSH_MODEL` | Override the Crush model (default `groq/openai/gpt-oss-120b`) |
-| `GH_COMMIT_CRUSH_TIMEOUT` | Per-prompt timeout in seconds (default `120`) |
-| `GH_COMMIT_DEBUG=1` | Show scope-response parse diagnostics |
+| Variable | Default | Purpose |
+|---|---|---|
+| `GH_COMMIT_OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `GH_COMMIT_MODEL` | `qwen3.5:2b` | Model tag |
+| `GH_COMMIT_TIMEOUT` | `120` | Per-request timeout, seconds |
+| `GH_COMMIT_AUTO` | `0` | `1` = skip all confirmations |
+| `GH_COMMIT_PUSH` | `0` | `1` = auto-push after commits |
+| `GH_COMMIT_NO_AUTO_REFRESH` | `0` | `1` = never auto-regenerate scopes |
+| `GH_COMMIT_DEBUG` | `0` | `1` = print raw model output on parse failure |
 
-## Migration
+## Storage
 
-Existing `.github/Repo.toml` or `.github/scopes.json` files are automatically detected and migrated to DuckDB on first run.
+Scopes live in `${XDG_DATA_HOME:-~/.local/share}/gh-commit/gh-commit.sqlite`.
+Legacy `.github/Repo.toml` and `.github/scopes.json` files are migrated
+automatically on first run (the source file is archived as
+`*.migrated.<timestamp>`). Databases from the old DuckDB-based Python version
+are not migrated; rerun `gh commit init`.
 
-## License
+## Manual acceptance
 
-MIT
+```sh
+mkdir /tmp/accept && cd /tmp/accept && git init
+mkdir -p src docs
+echo 'package app' > src/app.go
+echo '# Docs' > docs/README.md
+gh commit init          # scopes generated and saved
+echo '// change' >> src/app.go
+echo 'More docs' >> docs/README.md
+gh commit               # one commit per scope
+git log --format='%s'   # verify type(scope): message subjects
+```
+
+## Development
+
+```sh
+go test ./...                              # unit tests
+go test -tags integration -run TestSmoke . # needs a running Ollama server
+go build .
+```
+
+Releases are built by `cli/gh-extension-precompile` on `v*` tags for
+linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and windows/amd64
+(`CGO_ENABLED=0`; the SQLite driver is pure Go).
