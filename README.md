@@ -16,6 +16,13 @@ ollama pull qwen3.5:2b
 gh extension install prdlk/gh-commit
 ```
 
+### Requirements
+
+- [uv](https://docs.astral.sh/uv) — Python package runner (handles dependencies automatically)
+- [Crush](https://github.com/charmbracelet/crush) — configured with an authenticated model provider
+
+By default, gh-commit uses `openrouter/qwen/qwen3.6-27b`. Configure OpenRouter in Crush or override the model with `GH_COMMIT_CRUSH_MODEL`.
+
 ## Usage
 
 ```sh
@@ -42,15 +49,15 @@ Flags: `--auto` (skip confirmations), `--push` (auto-push), `--model`, `--host`.
 
 ## Environment
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `GH_COMMIT_OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `GH_COMMIT_MODEL` | `qwen3.5:2b` | Model tag |
-| `GH_COMMIT_TIMEOUT` | `120` | Per-request timeout, seconds |
-| `GH_COMMIT_AUTO` | `0` | `1` = skip all confirmations |
-| `GH_COMMIT_PUSH` | `0` | `1` = auto-push after commits |
-| `GH_COMMIT_NO_AUTO_REFRESH` | `0` | `1` = never auto-regenerate scopes |
-| `GH_COMMIT_DEBUG` | `0` | `1` = print raw model output on parse failure |
+| Variable | Description |
+|----------|-------------|
+| `GH_COMMIT_AUTO=1` | Skip all confirmation prompts |
+| `GH_COMMIT_PUSH=1` | Auto-push after commits |
+| `GH_COMMIT_NO_AUTO_REFRESH=1` | Don't auto-regenerate scopes when `.gitignore` changes |
+| `GH_COMMIT_CRUSH_CMD` | Override the Crush command (default `crush`) |
+| `GH_COMMIT_CRUSH_MODEL` | Override the Crush model (default `openrouter/qwen/qwen3.6-27b`) |
+| `GH_COMMIT_CRUSH_TIMEOUT` | Per-prompt timeout in seconds (default `120`) |
+| `GH_COMMIT_DEBUG=1` | Show scope-response parse diagnostics |
 
 ## Storage
 
