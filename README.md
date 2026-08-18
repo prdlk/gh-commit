@@ -16,9 +16,10 @@ gh extension install prdlk/gh-commit
 ### Requirements
 
 - [uv](https://docs.astral.sh/uv) — Python package runner (handles dependencies automatically)
-- [Crush](https://github.com/charmbracelet/crush) — configured with an authenticated model provider
+- [Crush](https://github.com/charmbracelet/crush) — non-interactive AI runner
+- `GROQ_API_KEY` — authenticates the default Groq model
 
-By default, gh-commit uses `openrouter/qwen/qwen3.6-27b`. Configure OpenRouter in Crush or override the model with `GH_COMMIT_CRUSH_MODEL`.
+By default, gh-commit uses Groq's `openai/gpt-oss-120b` via the bundled `crush-provider` config. Override the model with `GH_COMMIT_CRUSH_MODEL`.
 
 ## Usage
 
@@ -52,7 +53,7 @@ Flags: `--auto` (skip confirmations), `--push` (auto-push).
 | `GH_COMMIT_PUSH=1` | Auto-push after commits |
 | `GH_COMMIT_NO_AUTO_REFRESH=1` | Don't auto-regenerate scopes when `.gitignore` changes |
 | `GH_COMMIT_CRUSH_CMD` | Override the Crush command (default `crush`) |
-| `GH_COMMIT_CRUSH_MODEL` | Override the Crush model (default `openrouter/qwen/qwen3.6-27b`) |
+| `GH_COMMIT_CRUSH_MODEL` | Override the Crush model (default `groq/openai/gpt-oss-120b`) |
 | `GH_COMMIT_CRUSH_TIMEOUT` | Per-prompt timeout in seconds (default `120`) |
 | `GH_COMMIT_DEBUG=1` | Show scope-response parse diagnostics |
 
