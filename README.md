@@ -1,18 +1,15 @@
 # gh-commit
 
-AI-powered scoped git commits as a GitHub CLI extension, driven by a local
-Ollama model. Scopes map Conventional Commit scope names to path prefixes.
-They are generated from the repository file tree, stored in a local SQLite
-database, and auto-regenerate whenever `.gitignore` changes. Changed files are
-grouped by scope and committed one scope at a time with generated
-`type(scope): message` subjects.
+AI-powered scoped git commits as a GitHub CLI extension, driven by the
+[Crush](https://github.com/charmbracelet/crush) CLI. Scopes map Conventional
+Commit scope names to path prefixes. They are generated from the repository
+file tree, stored in a local DuckDB database, and auto-regenerate whenever
+`.gitignore` changes. Changed files are grouped by scope and committed one
+scope at a time with generated `type(scope): message` subjects.
 
 ## Install
 
 ```sh
-# Prerequisites: git, a running Ollama server, and the model
-ollama pull qwen3.5:2b
-
 gh extension install prdlk/gh-commit
 ```
 
@@ -36,7 +33,7 @@ gh commit        # commit changes grouped by scope
 | Command | Behavior |
 |---|---|
 | `gh commit` | Full scoped-commit flow: group changed files by scope, generate a message per group, confirm, commit, offer to push |
-| `gh commit init` | Generate scopes from the file tree via Ollama; migrates legacy configs; confirms overwrite |
+| `gh commit init` | Generate scopes from the file tree via Crush; migrates legacy configs; confirms overwrite |
 | `gh commit refresh` | Show current scopes, regenerate with existing scopes as context, confirm apply |
 | `gh commit sync` | Create/update GitHub labels from scopes (color = first 6 hex chars of MD5 of the scope name) |
 | `gh commit list` | Table of configured repositories: name, path, scope count |
@@ -45,7 +42,7 @@ gh commit        # commit changes grouped by scope
 | `gh commit version` | Print `gh-commit <version>` |
 | `gh commit help` | Help, including the DB path and environment variable docs |
 
-Flags: `--auto` (skip confirmations), `--push` (auto-push), `--model`, `--host`.
+Flags: `--auto` (skip confirmations), `--push` (auto-push).
 
 ## Environment
 
@@ -61,11 +58,10 @@ Flags: `--auto` (skip confirmations), `--push` (auto-push), `--model`, `--host`.
 
 ## Storage
 
-Scopes live in `${XDG_DATA_HOME:-~/.local/share}/gh-commit/gh-commit.sqlite`.
-Legacy `.github/Repo.toml` and `.github/scopes.json` files are migrated
-automatically on first run (the source file is archived as
-`*.migrated.<timestamp>`). Databases from the old DuckDB-based Python version
-are not migrated; rerun `gh commit init`.
+Scopes live in `${XDG_DATA_HOME:-~/.local/share}/gh-commit/gh-commit.db`
+(DuckDB). Legacy `.github/Repo.toml` and `.github/scopes.json` files are
+migrated automatically on first run (the source file is archived as
+`*.migrated.<timestamp>`).
 
 ## Manual acceptance
 
@@ -83,12 +79,12 @@ git log --format='%s'   # verify type(scope): message subjects
 
 ## Development
 
-```sh
-go test ./...                              # unit tests
-go test -tags integration -run TestSmoke . # needs a running Ollama server
-go build .
-```
+The extension is a bash launcher (`gh-commit`) that runs `smartcommit.py`
+with `uv run --script`; uv resolves the inline dependencies (duckdb, rich,
+questionary) automatically.
 
-Releases are built by `cli/gh-extension-precompile` on `v*` tags for
-linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and windows/amd64
-(`CGO_ENABLED=0`; the SQLite driver is pure Go).
+```sh
+python -m py_compile smartcommit.py   # syntax check
+bash -n gh-commit                     # launcher check
+./gh-commit version                   # smoke test
+```

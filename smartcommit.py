@@ -52,7 +52,7 @@ AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
 NO_AUTO_REFRESH = os.environ.get("GH_COMMIT_NO_AUTO_REFRESH", "0") == "1"
 DEBUG = os.environ.get("GH_COMMIT_DEBUG", "0") == "1"
 
-VERSION = "2.0.0"
+VERSION = "5.0.0"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

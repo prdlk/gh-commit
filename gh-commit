@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# gh-commit launcher — runs the bundled Python implementation via uv.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "gh-commit: 'uv' is required (https://docs.astral.sh/uv)" >&2
+  exit 1
+fi
+
+exec uv run --script "$DIR/smartcommit.py" "$@"
