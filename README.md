@@ -1,7 +1,7 @@
 # gh-commit
 
 AI-powered scoped git commits as a GitHub CLI extension, driven by the
-[Crush](https://github.com/charmbracelet/crush) CLI. Scopes map Conventional
+[OpenCode](https://opencode.ai) CLI. Scopes map Conventional
 Commit scope names to path prefixes. They are generated from the repository
 file tree, stored in a local DuckDB database, and auto-regenerate whenever
 `.gitignore` changes. Changed files are grouped by scope and committed one
@@ -16,10 +16,12 @@ gh extension install prdlk/gh-commit
 ### Requirements
 
 - [uv](https://docs.astral.sh/uv) — Python package runner (handles dependencies automatically)
-- [Crush](https://github.com/charmbracelet/crush) — non-interactive AI runner
-- `GROQ_API_KEY` — authenticates the default Groq model
+- [OpenCode](https://opencode.ai) — non-interactive AI runner (`opencode run`)
+- OpenCode Go access for the default model — `opencode auth login` (choose OpenCode Go) or set `OPENCODE_API_KEY`
 
-By default, gh-commit uses Groq's `openai/gpt-oss-120b` via the bundled `crush-provider` config. Override the model with `GH_COMMIT_CRUSH_MODEL`.
+By default, gh-commit uses `opencode-go/gpt-5.6-luna`: the fastest model in OpenCode Go's largest context tier (1.05M tokens). Override it with `GH_COMMIT_OPENCODE_MODEL` (any `provider/model` from `opencode models`).
+
+Prompts run through a private `opencode run --standalone` server with an inline read-only `gh-commit` agent: every tool except `read`, `glob`, and `grep` is denied, so the model never modifies the working tree.
 
 ## Usage
 
@@ -34,7 +36,7 @@ gh commit        # commit changes grouped by scope
 | Command | Behavior |
 |---|---|
 | `gh commit` | Full scoped-commit flow: group changed files by scope, generate a message per group, confirm, commit, offer to push |
-| `gh commit init` | Generate scopes from the file tree via Crush; migrates legacy configs; confirms overwrite |
+| `gh commit init` | Generate scopes from the file tree via OpenCode; migrates legacy configs; confirms overwrite |
 | `gh commit refresh` | Show current scopes, regenerate with existing scopes as context, confirm apply |
 | `gh commit sync` | Create/update GitHub labels from scopes (color = first 6 hex chars of MD5 of the scope name) |
 | `gh commit list` | Table of configured repositories: name, path, scope count |
@@ -52,9 +54,9 @@ Flags: `--auto` (skip confirmations), `--push` (auto-push).
 | `GH_COMMIT_AUTO=1` | Skip all confirmation prompts |
 | `GH_COMMIT_PUSH=1` | Auto-push after commits |
 | `GH_COMMIT_NO_AUTO_REFRESH=1` | Don't auto-regenerate scopes when `.gitignore` changes |
-| `GH_COMMIT_CRUSH_CMD` | Override the Crush command (default `crush`) |
-| `GH_COMMIT_CRUSH_MODEL` | Override the Crush model (default `groq/openai/gpt-oss-120b`) |
-| `GH_COMMIT_CRUSH_TIMEOUT` | Per-prompt timeout in seconds (default `120`) |
+| `GH_COMMIT_OPENCODE_CMD` | Override the OpenCode command (default `opencode`) |
+| `GH_COMMIT_OPENCODE_MODEL` | Override the model (default `opencode-go/gpt-5.6-luna`) |
+| `GH_COMMIT_OPENCODE_TIMEOUT` | Per-prompt timeout in seconds (default `120`) |
 | `GH_COMMIT_DEBUG=1` | Show scope-response parse diagnostics |
 
 ## Storage

@@ -9,7 +9,7 @@
 # ///
 """gh-commit - AI-powered scoped git commits.
 
-Both AI steps run through `crush run`: scope generation sends the repository's
+Both AI steps run through `opencode run`: scope generation sends the repository's
 file tree with embedded scope-identification instructions, and commit-message
 writing sends the staged diff with embedded Conventional Commits instructions.
 Scopes live in a local DuckDB and auto-regenerate
@@ -41,20 +41,28 @@ console = Console()
 DB_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "gh-commit"
 DB_PATH = DB_DIR / "gh-commit.db"
 
-# Crush handles both AI steps in non-interactive mode. The instructions formerly
-# stored as mods roles are embedded below so this tool is self-contained.
-CRUSH_CMD = os.environ.get("GH_COMMIT_CRUSH_CMD", "crush").split()
-DEFAULT_CRUSH_MODEL = "groq/openai/gpt-oss-120b"
-CRUSH_MODEL = os.environ.get("GH_COMMIT_CRUSH_MODEL", DEFAULT_CRUSH_MODEL)
-CRUSH_CONFIG_DIR = Path(__file__).with_name("crush-provider")
-CRUSH_TIMEOUT = int(os.environ.get("GH_COMMIT_CRUSH_TIMEOUT", "120"))
+# OpenCode handles both AI steps in non-interactive mode. The instructions
+# formerly stored as mods roles are embedded below so this tool is self-contained.
+OPENCODE_CMD = os.environ.get("GH_COMMIT_OPENCODE_CMD", "opencode").split()
+# Fastest model in the largest-context (1.05M) tier of the OpenCode Go provider.
+DEFAULT_OPENCODE_MODEL = "opencode-go/gpt-5.6-luna"
+OPENCODE_MODEL = os.environ.get("GH_COMMIT_OPENCODE_MODEL", DEFAULT_OPENCODE_MODEL)
+OPENCODE_TIMEOUT = int(os.environ.get("GH_COMMIT_OPENCODE_TIMEOUT", "120"))
+# Read-only agent: everything is denied except read/glob/grep, so the model can
+# never modify the working tree. (Denying every tool breaks OpenCode's free tier.)
+OPENCODE_AGENT = "gh-commit"
+OPENCODE_AGENT_CONFIG = {
+    "mode": "primary",
+    "description": "gh-commit message and scope generator (read-only)",
+    "permission": {"*": "deny", "read": "allow", "glob": "allow", "grep": "allow"},
+}
 
 AUTO_CONFIRM = os.environ.get("GH_COMMIT_AUTO", "0") == "1"
 AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
 NO_AUTO_REFRESH = os.environ.get("GH_COMMIT_NO_AUTO_REFRESH", "0") == "1"
 DEBUG = os.environ.get("GH_COMMIT_DEBUG", "0") == "1"
 
-VERSION = "5.0.1"
+VERSION = "6.0.0"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -98,10 +106,10 @@ def require_git() -> Path:
     return get_repo_root()
 
 
-# ── Crush CLI client ──────────────────────────────────────────────────────────
+# ── OpenCode CLI client ───────────────────────────────────────────────────────
 
-class CrushError(RuntimeError):
-    """Raised when `crush run` fails to produce output."""
+class OpencodeError(RuntimeError):
+    """Raised when `opencode run` fails to produce output."""
 
 
 def build_filetree(repo_path: Path) -> str:
@@ -112,29 +120,62 @@ def build_filetree(repo_path: Path) -> str:
     return "\n".join(files)
 
 
-def crush_prompt(text: str, cwd: Path) -> str:
-    """Send `text` to `crush run` and return its reply."""
-    cmd = [*CRUSH_CMD, "run", "--quiet"]
-    if CRUSH_MODEL:
-        cmd += ["--model", CRUSH_MODEL]
+def opencode_env() -> dict[str, str]:
+    """Environment with the text-only gh-commit agent merged into inline config."""
     env = os.environ.copy()
-    if CRUSH_MODEL == DEFAULT_CRUSH_MODEL:
-        env.setdefault("CRUSH_GLOBAL_CONFIG", str(CRUSH_CONFIG_DIR))
+    try:
+        config = json.loads(env.get("OPENCODE_CONFIG_CONTENT") or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    config.setdefault("agent", {})[OPENCODE_AGENT] = OPENCODE_AGENT_CONFIG
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+    return env
+
+
+def parse_opencode_events(stdout: str) -> str:
+    """Return the final assistant message text from `opencode run --format json`."""
+    texts: dict[str, list[str]] = {}
+    last_message = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "error":
+            error = event.get("error") or {}
+            raise OpencodeError(error.get("message") or json.dumps(error))
+        part = event.get("part") or {}
+        if event.get("type") == "text" and part.get("text"):
+            last_message = part.get("messageID")
+            texts.setdefault(last_message, []).append(part["text"])
+    return "".join(texts.get(last_message, [])).strip()
+
+
+def opencode_prompt(text: str, cwd: Path) -> str:
+    """Send `text` to `opencode run` and return its reply."""
+    # --standalone runs a private server so this process's env (API keys, inline
+    # agent config) and cwd apply, instead of the shared background service's.
+    cmd = [*OPENCODE_CMD, "run", "--standalone", "--format", "json", "--agent", OPENCODE_AGENT]
+    if OPENCODE_MODEL:
+        cmd += ["--model", OPENCODE_MODEL]
     try:
         result = subprocess.run(
-            cmd, input=text, capture_output=True, text=True, env=env,
-            cwd=str(cwd), timeout=CRUSH_TIMEOUT,
+            cmd, input=text, capture_output=True, text=True, env=opencode_env(),
+            cwd=str(cwd), timeout=OPENCODE_TIMEOUT,
         )
     except FileNotFoundError as e:
-        raise CrushError(
-            f"Could not run the Crush CLI ({CRUSH_CMD[0]!r} not found). "
-            "Install Crush, or set GH_COMMIT_CRUSH_CMD to a working command."
+        raise OpencodeError(
+            f"Could not run the OpenCode CLI ({OPENCODE_CMD[0]!r} not found). "
+            "Install OpenCode, or set GH_COMMIT_OPENCODE_CMD to a working command."
         ) from e
     except subprocess.TimeoutExpired as e:
-        raise CrushError(f"crush run timed out after {CRUSH_TIMEOUT}s") from e
+        raise OpencodeError(f"opencode run timed out after {OPENCODE_TIMEOUT}s") from e
+    reply = parse_opencode_events(result.stdout)
     if result.returncode != 0:
-        raise CrushError(result.stderr.strip() or f"crush run exited with {result.returncode}")
-    return result.stdout.strip()
+        raise OpencodeError(result.stderr.strip() or f"opencode run exited with {result.returncode}")
+    if not reply:
+        raise OpencodeError("opencode run returned no text")
+    return reply
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -417,7 +458,7 @@ def filter_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-# ── AI integration (Crush CLI) ────────────────────────────────────────────────
+# ── AI integration (OpenCode CLI) ─────────────────────────────────────────────
 
 COMMIT_PROMPT = """\
 You are an expert conventional commit message writer.
@@ -513,9 +554,9 @@ def generate_commit_message(diff: str, repo_path: Path, scope: Optional[str] = N
     scope_hint = f"Use this scope: {scope}\n" if scope else ""
     prompt = COMMIT_PROMPT.format(scope_hint=scope_hint, diff=filter_diff(diff))
     try:
-        message = crush_prompt(prompt, repo_path)
-    except CrushError as e:
-        console.print(f"[red]Crush failed to generate a commit message: {e}[/]")
+        message = opencode_prompt(prompt, repo_path)
+    except OpencodeError as e:
+        console.print(f"[red]OpenCode failed to generate a commit message: {e}[/]")
         return None
     # Strip stray code fences if the model added them anyway.
     message = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", message.strip()).strip()
@@ -532,14 +573,14 @@ def generate_scopes(repo_path: Path, existing: Optional[dict[str, list[str]]] = 
     else:
         prompt = SCOPE_PROMPT_NEW.format(filetree=filetree)
     try:
-        with console.status("[magenta]Analyzing repository with Crush...[/]"):
-            output = crush_prompt(prompt, repo_path)
-    except CrushError as e:
-        console.print(f"[red]Crush failed: {e}[/]")
+        with console.status("[magenta]Analyzing repository with OpenCode...[/]"):
+            output = opencode_prompt(prompt, repo_path)
+    except OpencodeError as e:
+        console.print(f"[red]OpenCode failed: {e}[/]")
         return None
     scopes = parse_scopes_response(output)
     if not scopes:
-        console.print("[red]Could not parse scopes from Crush's response[/]")
+        console.print("[red]Could not parse scopes from OpenCode's response[/]")
         if DEBUG:
             console.print(f"[dim]{output}[/]")
     return scopes
@@ -637,7 +678,7 @@ def maybe_auto_refresh_scopes(repo_path: Path, repo_name: str):
     if current == stored:
         return
 
-    console.print("[yellow]↻ .gitignore changed — regenerating scopes with Crush...[/]")
+    console.print("[yellow]↻ .gitignore changed — regenerating scopes with OpenCode...[/]")
     existing = get_repo_scopes(str(repo_path))
     scopes = generate_scopes(repo_path, existing)
     if not scopes:
@@ -656,7 +697,7 @@ def cmd_version():
 
 
 def cmd_help():
-    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (Crush)\n")
+    console.print(f"[magenta bold]gh commit[/] [dim]v{VERSION}[/] — AI-powered scoped git commits (OpenCode)\n")
     console.print("[cyan]Usage:[/]")
     console.print("  gh commit                  Commit changes grouped by scope")
     console.print("  gh commit --auto           Auto-confirm all prompts")
@@ -676,9 +717,9 @@ def cmd_help():
     console.print("  GH_COMMIT_AUTO=1           Skip all confirmation prompts")
     console.print("  GH_COMMIT_PUSH=1           Auto-push after commits")
     console.print("  GH_COMMIT_NO_AUTO_REFRESH=1  Don't auto-regenerate scopes on .gitignore change")
-    console.print("  GH_COMMIT_CRUSH_CMD=...    Override the Crush command")
-    console.print(f"  GH_COMMIT_CRUSH_MODEL=...  Override the Crush model (default: {DEFAULT_CRUSH_MODEL})")
-    console.print("  GH_COMMIT_CRUSH_TIMEOUT=...  Per-prompt timeout in seconds (default: 120)")
+    console.print("  GH_COMMIT_OPENCODE_CMD=...    Override the OpenCode command")
+    console.print(f"  GH_COMMIT_OPENCODE_MODEL=...  Override the model (default: {DEFAULT_OPENCODE_MODEL})")
+    console.print("  GH_COMMIT_OPENCODE_TIMEOUT=...  Per-prompt timeout in seconds (default: 120)")
     console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
@@ -839,7 +880,7 @@ def cmd_commit():
     if not repo_has_scopes(str(repo_path)):
         console.print("\n[yellow bold]⚠ No scopes configured for this repository[/]\n")
         console.print("[cyan]gh-commit organizes commits by project areas (scopes).[/]\n")
-        if confirm("Generate scopes now using Crush?"):
+        if confirm("Generate scopes now using OpenCode?"):
             if cmd_init() != 0:
                 return 1
         else:
