@@ -47,6 +47,16 @@ gh commit        # commit changes grouped by scope
 
 Flags: `--auto` (skip confirmations), `--push` (auto-push).
 
+### Submodules
+
+`gh commit` recurses into checked-out submodules at any depth. When any has
+uncommitted changes or unpushed commits, it lists them and asks
+`Commit submodules too?` before touching the parent. On yes, each submodule
+runs the full flow (its own scopes, commits, push prompt), deepest first, so
+each parent then commits its submodules' updated pointers. Submodules on a
+detached HEAD are skipped with a warning; check out a branch to include them.
+`--auto` answers yes.
+
 ## Environment
 
 | Variable | Description |

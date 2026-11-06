@@ -62,7 +62,7 @@ AUTO_PUSH = os.environ.get("GH_COMMIT_PUSH", "0") == "1"
 NO_AUTO_REFRESH = os.environ.get("GH_COMMIT_NO_AUTO_REFRESH", "0") == "1"
 DEBUG = os.environ.get("GH_COMMIT_DEBUG", "0") == "1"
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -633,6 +633,24 @@ def push_to_origin():
     console.print(f"[green]✓ Pushed to origin/{branch}[/]")
 
 
+def get_submodules() -> list[Path]:
+    """Checked-out submodules at any depth, deepest first.
+
+    `git submodule foreach --recursive` visits a submodule before its children,
+    so reversing it yields children before their parent: committing in this
+    order lets each parent record its children's new commits.
+    """
+    output = git("submodule", "foreach", "--recursive", "--quiet", 'echo "$toplevel/$sm_path"')
+    return [Path(p) for p in reversed(output.split("\n")) if p]
+
+
+def has_pending_work(repo: Path) -> bool:
+    """True when `repo` has uncommitted changes or unpushed commits."""
+    if git("-C", str(repo), "status", "--porcelain"):
+        return True
+    return bool(git("-C", str(repo), "log", "--branches", "--not", "--remotes", "--oneline"))
+
+
 def commit_group(repo_path: Path, files: list[str], scope: Optional[str] = None) -> bool:
     """Stage `files`, generate a message, and commit them as one group."""
     files = [f for f in files if f]
@@ -722,6 +740,7 @@ def cmd_help():
     console.print("  GH_COMMIT_OPENCODE_TIMEOUT=...  Per-prompt timeout in seconds (default: 120)")
     console.print("  GH_COMMIT_DEBUG=1          Show parse diagnostics\n")
     console.print("[cyan]Scopes auto-refresh whenever .gitignore changes.[/]")
+    console.print("[cyan]Submodules with changes are offered first (deepest first), so parents record their new commits.[/]")
     console.print("[cyan]Legacy .github/Repo.toml or scopes.json are auto-migrated on first run.[/]")
 
 
@@ -871,8 +890,45 @@ def cmd_sync():
     return 0
 
 
+def commit_submodule(sub_path: Path, root: Path):
+    """Run the scoped-commit flow inside one submodule, restoring the cwd afterwards."""
+    console.rule(f"[magenta bold]Submodule: {os.path.relpath(sub_path, root)}[/]")
+    previous = Path.cwd()
+    os.chdir(sub_path)
+    try:
+        if not git("branch", "--show-current"):
+            console.print("[yellow]⚠ Detached HEAD — check out a branch in this submodule to commit it; skipping[/]\n")
+            return
+        commit_repo(sub_path)
+    finally:
+        os.chdir(previous)
+    console.print()
+
+
 def cmd_commit():
     repo_path = require_git()
+
+    pending = [p for p in get_submodules() if has_pending_work(p)]
+    if pending:
+        console.print(f"[magenta bold]Submodules with changes ({len(pending)}):[/]")
+        for sub in pending:
+            console.print(f"[dim]  {os.path.relpath(sub, repo_path)}[/]")
+        console.print()
+        if confirm("Commit submodules too?"):
+            for sub in pending:
+                commit_submodule(sub, repo_path)
+            console.rule(f"[magenta bold]{repo_path.name}[/]")
+        else:
+            console.print("[dim]Skipping submodules[/]\n")
+
+    result = commit_repo(repo_path)
+    if result == 0:
+        console.print("\n[green bold]✓ Done![/]")
+    return result
+
+
+def commit_repo(repo_path: Path) -> int:
+    """Scoped-commit flow for the repository at the current working directory."""
     repo_name = repo_path.name
 
     auto_migrate(repo_path)
@@ -951,7 +1007,6 @@ def cmd_commit():
     else:
         console.print("\n[dim]No unpushed commits[/]")
 
-    console.print("\n[green bold]✓ Done![/]")
     return 0
 
 
